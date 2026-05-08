@@ -562,3 +562,58 @@ fn stop_still_emits_after_tool_complete_suppression() {
     assert!(result.is_some());
     assert_eq!(session.status, CLIAgentSessionStatus::Success);
 }
+
+#[test]
+fn question_asked_then_permission_replied_suppresses_flicker() {
+    let mut session = make_test_session();
+    let mut transitions = 0u32;
+
+    if session
+        .apply_event(&make_test_event(CLIAgentEventType::PromptSubmit))
+        .is_some()
+    {
+        transitions += 1;
+    }
+
+    // QuestionAsked emits Blocked
+    if session
+        .apply_event(&make_test_event(CLIAgentEventType::QuestionAsked))
+        .is_some()
+    {
+        transitions += 1;
+    }
+    assert!(matches!(
+        session.status,
+        CLIAgentSessionStatus::Blocked { .. }
+    ));
+
+    // PermissionReplied updates internal state but does NOT emit
+    let result = session.apply_event(&make_test_event(CLIAgentEventType::PermissionReplied));
+    assert!(result.is_none());
+    assert_eq!(session.status, CLIAgentSessionStatus::InProgress);
+
+    // Another permission-gated tool
+    if session
+        .apply_event(&make_test_event(CLIAgentEventType::PermissionRequest))
+        .is_some()
+    {
+        transitions += 1;
+    }
+    if session
+        .apply_event(&make_test_event(CLIAgentEventType::ToolComplete))
+        .is_some()
+    {
+        transitions += 1;
+    }
+
+    if session
+        .apply_event(&make_test_event(CLIAgentEventType::Stop))
+        .is_some()
+    {
+        transitions += 1;
+    }
+
+    // PromptSubmit + QuestionAsked(Blocked) + PermissionRequest(Blocked) + Stop = 4
+    // PermissionReplied and ToolComplete are suppressed
+    assert_eq!(transitions, 4);
+}
