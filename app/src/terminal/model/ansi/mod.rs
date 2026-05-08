@@ -397,14 +397,10 @@ impl Processor {
     {
         let mut bytes = input.bytes;
 
-        // Bytes are parsed fundamentally differently if they're coming from a connection to tmux
-        // control mode vs a standard pty. Though quite uncommon, tmux control mode can potentially
-        // be entered and exited multiple times in a batch of bytes. This loop is so we can
-        // continue to process bytes until we've processed through all tmux control mode state
-        // changes.
         while !bytes.is_empty() {
-            match &mut self.state.tmux_control_mode {
-                None => {
+            if self.state.tmux_control_mode.is_none() {
+                // When sync output is active, use the buffering path
+                if self.state.sync_output.is_active() {
                     let mut remaining_bytes_index = bytes.len();
                     for (idx, byte) in bytes.iter().enumerate() {
                         let was_sync_output = self.state.sync_output.is_active();
@@ -414,11 +410,6 @@ impl Processor {
                         if self.state.tmux_control_mode.is_some()
                             || was_sync_output != is_sync_output
                         {
-                            // We split up the batch processing in two cases:
-                            // 1. Tmux control mode started. Remaining bytes must be processed in a
-                            //    control mode context.
-                            // 2. Synchronized output was toggled. The pre- and post-toggle bytes should be
-                            //    handled in separate `on_finish_byte_processing` calls.
                             remaining_bytes_index = idx + 1;
                             break;
                         }
@@ -429,60 +420,180 @@ impl Processor {
                     });
 
                     if self.state.tmux_control_mode.is_some() {
-                        // Tmux control mode has just started -- notify the handler.
                         handler.tmux_control_mode_event(ControlModeEvent::Starting);
                     }
 
                     bytes = &bytes[remaining_bytes_index..];
+                    continue;
                 }
 
-                Some(tmux_control_mode) => {
-                    let mut tmux_performer = TmuxPerformer::new(
-                        &mut tmux_control_mode.control_mode_state,
-                        handler,
-                        writer,
-                    );
-                    let mut remaining_bytes_index = bytes.len();
-                    for (idx, byte) in bytes.iter().enumerate() {
-                        tmux_control_mode
-                            .control_mode_parser
-                            .advance(&mut tmux_performer, *byte);
+                let state = &mut self.state;
+                let parser = &mut self.parser;
+                let mut remaining_bytes_index = bytes.len();
 
-                        if tmux_performer.exited {
-                            remaining_bytes_index = idx + 1;
-                            break;
+                let mut performer = Performer::new(state, handler, writer);
+                let mut idx = 0;
+                while idx < bytes.len() {
+                    if parser.is_ground_state() {
+                        let remaining = &bytes[idx..];
+                        let ascii_len = remaining
+                            .iter()
+                            .position(|&b| b < 0x20 || b > 0x7E)
+                            .unwrap_or(remaining.len());
+                        if ascii_len > 0 {
+                            let ascii_run = &bytes[idx..idx + ascii_len];
+                            for &b in ascii_run {
+                                performer.handler.input(b as char);
+                            }
+                            performer.state.preceding_char =
+                                Some(ascii_run[ascii_run.len() - 1] as char);
+                            idx += ascii_len;
+                            continue;
                         }
                     }
 
-                    let control_mode_exited = tmux_performer.exited;
-                    let parse_error = tmux_performer.parse_error;
-                    let primary_pane_output = tmux_performer.finish();
-                    handler.on_finish_byte_processing(&ProcessorInput {
-                        bytes: &primary_pane_output,
-                        ..input
-                    });
-
-                    if control_mode_exited {
-                        self.state.tmux_control_mode = None;
-
-                        // Tmux control mode has just exited -- notify the handler.
-                        handler.tmux_control_mode_event(ControlModeEvent::Exited);
-
-                        if parse_error {
-                            // A parse error means that means control mode has exited unexpectedly and we
-                            // shouldn't expect to get the OSC end marker, so we reset our state back to
-                            // default manually.
-                            *self = Default::default();
-
-                            // A parse error also indicates that the last byte read (that caused the parse
-                            // error) actually isn't from tmux control mode, so we should process it along
-                            // with the rest of the remaining input.
-                            remaining_bytes_index -= 1;
+                    // CSI fast-scan: detect ESC[ and parse entire sequence at once
+                    if parser.is_ground_state() && bytes[idx] == 0x1b {
+                        if idx + 1 < bytes.len() && bytes[idx + 1] == b'[' {
+                            let csi_start = idx + 2;
+                            let mut csi_end = csi_start;
+                            let mut valid = true;
+                            while csi_end < bytes.len() {
+                                let b = bytes[csi_end];
+                                if (0x40..=0x7E).contains(&b) {
+                                    break;
+                                } else if (0x20..=0x3F).contains(&b) {
+                                    csi_end += 1;
+                                } else {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            if valid && csi_end < bytes.len() {
+                                let final_byte = bytes[csi_end];
+                                let params_slice = &bytes[csi_start..csi_end];
+                                // Parse numeric params separated by ; or :
+                                let mut params = vte::Params::default();
+                                let mut intermediates: [u8; 2] = [0; 2];
+                                let mut intermediates_len = 0usize;
+                                let mut current_num: u16 = 0;
+                                let mut has_digit = false;
+                                for &pb in params_slice {
+                                    match pb {
+                                        b'0'..=b'9' => {
+                                            current_num = current_num
+                                                .saturating_mul(10)
+                                                .saturating_add((pb - b'0') as u16);
+                                            has_digit = true;
+                                        }
+                                        b';' => {
+                                            params.push(if has_digit { current_num } else { 0 });
+                                            current_num = 0;
+                                            has_digit = false;
+                                        }
+                                        b':' => {
+                                            // Subparam separator
+                                            if has_digit {
+                                                params.push(current_num);
+                                            } else {
+                                                params.push(0);
+                                            }
+                                            current_num = 0;
+                                            has_digit = false;
+                                        }
+                                        b'<'..=b'?' => {
+                                            // Private mode indicator
+                                            if intermediates_len < 2 {
+                                                intermediates[intermediates_len] = pb;
+                                                intermediates_len += 1;
+                                            }
+                                        }
+                                        b' '..=b'/' => {
+                                            if intermediates_len < 2 {
+                                                intermediates[intermediates_len] = pb;
+                                                intermediates_len += 1;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                // Push last param
+                                if has_digit || !params.is_empty() {
+                                    params.push(if has_digit { current_num } else { 0 });
+                                }
+                                performer.csi_dispatch(
+                                    &params,
+                                    &intermediates[..intermediates_len],
+                                    false,
+                                    final_byte as char,
+                                );
+                                idx = csi_end + 1;
+                                continue;
+                            }
                         }
                     }
 
-                    bytes = &bytes[remaining_bytes_index..];
+                    let was_sync_output = performer.state.sync_output.is_active();
+                    parser.advance(&mut performer, bytes[idx]);
+                    let is_sync_output = performer.state.sync_output.is_active();
+
+                    if performer.state.tmux_control_mode.is_some()
+                        || was_sync_output != is_sync_output
+                    {
+                        remaining_bytes_index = idx + 1;
+                        break;
+                    }
+                    idx += 1;
                 }
+
+                handler.on_finish_byte_processing(&ProcessorInput {
+                    bytes: &bytes[..remaining_bytes_index],
+                    ..input
+                });
+
+                if self.state.tmux_control_mode.is_some() {
+                    handler.tmux_control_mode_event(ControlModeEvent::Starting);
+                }
+
+                bytes = &bytes[remaining_bytes_index..];
+            } else {
+                let tmux_control_mode = self.state.tmux_control_mode.as_mut().unwrap();
+                let mut tmux_performer = TmuxPerformer::new(
+                    &mut tmux_control_mode.control_mode_state,
+                    handler,
+                    writer,
+                );
+                let mut remaining_bytes_index = bytes.len();
+                for (idx, byte) in bytes.iter().enumerate() {
+                    tmux_control_mode
+                        .control_mode_parser
+                        .advance(&mut tmux_performer, *byte);
+
+                    if tmux_performer.exited {
+                        remaining_bytes_index = idx + 1;
+                        break;
+                    }
+                }
+
+                let control_mode_exited = tmux_performer.exited;
+                let parse_error = tmux_performer.parse_error;
+                let primary_pane_output = tmux_performer.finish();
+                handler.on_finish_byte_processing(&ProcessorInput {
+                    bytes: &primary_pane_output,
+                    ..input
+                });
+
+                if control_mode_exited {
+                    self.state.tmux_control_mode = None;
+                    handler.tmux_control_mode_event(ControlModeEvent::Exited);
+
+                    if parse_error {
+                        *self = Default::default();
+                        remaining_bytes_index -= 1;
+                    }
+                }
+
+                bytes = &bytes[remaining_bytes_index..];
             }
         }
     }

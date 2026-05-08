@@ -1,0 +1,22 @@
+[package]
+name = "warp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.vte]
+path = "../../vte-local"
+
+[[bin]]
+name = "fuzz_ansi_parser"
+path = "fuzz_targets/fuzz_ansi_parser.rs"
+doc = false
+
+[workspace]
+members = ["."]

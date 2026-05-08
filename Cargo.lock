@@ -14042,7 +14042,6 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 [[package]]
 name = "utf8parse"
 version = "0.2.1"
-source = "git+https://github.com/warpdotdev/vte.git?rev=4b399c87b63ba88f45709edaa6383fc519f6c900#4b399c87b63ba88f45709edaa6383fc519f6c900"
 
 [[package]]
 name = "utf8parse"
@@ -14221,7 +14220,6 @@ dependencies = [
 [[package]]
 name = "vte"
 version = "0.13.0"
-source = "git+https://github.com/warpdotdev/vte.git?rev=4b399c87b63ba88f45709edaa6383fc519f6c900#4b399c87b63ba88f45709edaa6383fc519f6c900"
 dependencies = [
  "utf8parse 0.2.1",
  "vte_generate_state_changes",
@@ -14230,7 +14228,6 @@ dependencies = [
 [[package]]
 name = "vte_generate_state_changes"
 version = "0.1.1"
-source = "git+https://github.com/warpdotdev/vte.git?rev=4b399c87b63ba88f45709edaa6383fc519f6c900#4b399c87b63ba88f45709edaa6383fc519f6c900"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -14319,6 +14316,7 @@ dependencies = [
  "counter 0.6.0",
  "crash-handler",
  "crc",
+ "criterion",
  "csv",
  "ctor",
  "cvt",
