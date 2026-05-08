@@ -546,18 +546,32 @@ impl Processor {
                                             }
                                         }
                                     }
-                                    // Ultra-fast: \x1b[<d>;<d>H (cursor, 1-digit params)
+                                    // Ultra-fast: \x1b[<d>;<d><final> (2 single-digit params)
                                     if remain >= 6 {
                                         let p0 = bytes[idx + 2];
                                         if p0.is_ascii_digit() && bytes[idx + 3] == b';' {
                                             let p1 = bytes[idx + 4];
-                                            if p1.is_ascii_digit() && bytes[idx + 5] == b'H' {
+                                            let fb = bytes[idx + 5];
+                                            if p1.is_ascii_digit() && fb >= 0x40 && fb <= 0x7E {
                                                 let mut params = vte::Params::default();
                                                 params.push((p0 - b'0') as u16);
                                                 params.push((p1 - b'0') as u16);
-                                                performer.csi_dispatch(&params, &[], false, 'H');
+                                                performer.csi_dispatch(&params, &[], false, fb as char);
                                                 idx += 6;
                                                 continue;
+                                            }
+                                            // \x1b[<d>;<dd><final> (1+2 digit params)
+                                            if remain >= 7 && p1.is_ascii_digit() {
+                                                let p1b = bytes[idx + 5];
+                                                let fb2 = bytes[idx + 6];
+                                                if p1b.is_ascii_digit() && fb2 >= 0x40 && fb2 <= 0x7E {
+                                                    let mut params = vte::Params::default();
+                                                    params.push((p0 - b'0') as u16);
+                                                    params.push((p1 - b'0') as u16 * 10 + (p1b - b'0') as u16);
+                                                    performer.csi_dispatch(&params, &[], false, fb2 as char);
+                                                    idx += 7;
+                                                    continue;
+                                                }
                                             }
                                         }
                                     }
