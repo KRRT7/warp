@@ -514,19 +514,16 @@ impl Processor {
                     if parser.is_ground_state() && bytes[idx] == 0x1b {
                         if idx + 1 < bytes.len() && bytes[idx + 1] == b'[' {
                             let csi_start = idx + 2;
-                            let mut csi_end = csi_start;
-                            let mut valid = true;
-                            while csi_end < bytes.len() {
-                                let b = bytes[csi_end];
-                                if (0x40..=0x7E).contains(&b) {
-                                    break;
-                                } else if (0x20..=0x3F).contains(&b) {
-                                    csi_end += 1;
-                                } else {
-                                    valid = false;
-                                    break;
+                            let csi_bytes = &bytes[csi_start..];
+                            // Find first byte that's a CSI terminator (0x40..=0x7E)
+                            // or invalid (< 0x20)
+                            let scan_result = csi_bytes.iter().position(|&b| b >= 0x40 || b < 0x20);
+                            let (csi_end, valid) = match scan_result {
+                                Some(pos) if csi_bytes[pos] >= 0x40 && csi_bytes[pos] <= 0x7E => {
+                                    (csi_start + pos, true)
                                 }
-                            }
+                                _ => (csi_start, false),
+                            };
                             if valid && csi_end < bytes.len() {
                                 let final_byte = bytes[csi_end];
                                 let params_slice = &bytes[csi_start..csi_end];

@@ -249,51 +249,57 @@ impl Index {
             }
 
             // Fast path: uniform row with carry-over (softwrap narrowing)
+            // Only for cell_width==1 to avoid wide-char leading spacer edge cases.
             if let GraphemeSizing::Uniform(run) = &entry.grapheme_sizing {
-                if run.info.cell_width == 1 {
+                let cell_width = run.info.cell_width as usize;
+                if cell_width == 1 {
                     let count = run.count.get() as usize;
                     let byte_len = run.info.utf8_bytes.get() as usize;
-                    let remaining = index.columns.saturating_sub(entry_builder.num_cells);
+                    let remaining_cells = index.columns.saturating_sub(entry_builder.num_cells);
+                    let remaining_graphemes = remaining_cells / cell_width;
+                    let graphemes_per_row = columns / cell_width;
 
-                    if remaining > 0 && remaining < count {
+                    if remaining_graphemes > 0 && remaining_graphemes < count
+                        && graphemes_per_row > 0
+                    {
                         // Fill remaining space in current row
-                        entry_builder.num_cells += remaining;
-                        entry_builder.incr_content_offset += remaining * byte_len;
+                        entry_builder.num_cells += remaining_graphemes * cell_width;
+                        entry_builder.incr_content_offset += remaining_graphemes * byte_len;
                         match entry_builder.grapheme_runs.last_mut() {
                             Some(last) if last.info == run.info => {
-                                last.count = last.count.checked_add(remaining as u16)
+                                last.count = last.count.checked_add(remaining_graphemes as u16)
                                     .expect("overflow");
                             }
                             _ => {
                                 entry_builder.grapheme_runs.push(GraphemeRun {
-                                    count: NonZeroU16::new(remaining as u16).unwrap(),
+                                    count: NonZeroU16::new(remaining_graphemes as u16).unwrap(),
                                     info: run.info,
                                 });
                             }
                         }
                         // Flush the full row
-                        std::mem::take(&mut entry_builder).append_to_index(&mut index);
+                        entry_builder.flush_to_index(&mut index);
 
                         // Process remaining graphemes with arithmetic
-                        let mut rem = count - remaining;
-                        while rem > columns {
+                        let mut rem = count - remaining_graphemes;
+                        while rem > graphemes_per_row {
                             let content_offset: ByteOffset = index.content_len.into();
-                            index.content_len += columns * byte_len;
+                            index.content_len += graphemes_per_row * byte_len;
                             index.rows.push_back(Entry {
                                 content_offset,
                                 grapheme_sizing: GraphemeSizing::Uniform(GraphemeRun {
-                                    count: NonZeroU16::new(columns as u16).unwrap(),
+                                    count: NonZeroU16::new(graphemes_per_row as u16).unwrap(),
                                     info: run.info,
                                 }),
                                 has_trailing_newline: false,
                                 ends_with_leading_wide_char_spacer: false,
                             });
-                            rem -= columns;
+                            rem -= graphemes_per_row;
                         }
 
                         // Leftover goes into entry_builder
                         if rem > 0 {
-                            entry_builder.num_cells = rem;
+                            entry_builder.num_cells = rem * cell_width;
                             entry_builder.incr_content_offset += rem * byte_len;
                             entry_builder.grapheme_runs.push(GraphemeRun {
                                 count: NonZeroU16::new(rem as u16).unwrap(),
@@ -304,7 +310,30 @@ impl Index {
                         // Handle newline
                         if entry.has_trailing_newline {
                             entry_builder.add_trailing_newline();
-                            std::mem::take(&mut entry_builder).append_to_index(&mut index);
+                            entry_builder.flush_to_index(&mut index);
+                        }
+                        continue;
+                    }
+
+                    // Also handle when the entire run fits in remaining space
+                    // Only safe when cell_width==1 or total cells don't overflow the row
+                    if count <= remaining_graphemes
+                        && entry_builder.num_cells + count * cell_width <= columns
+                    {
+                        entry_builder.num_cells += count * cell_width;
+                        entry_builder.incr_content_offset += count * byte_len;
+                        match entry_builder.grapheme_runs.last_mut() {
+                            Some(last) if last.info == run.info => {
+                                last.count = last.count.checked_add(count as u16)
+                                    .expect("overflow");
+                            }
+                            _ => {
+                                entry_builder.grapheme_runs.push(*run);
+                            }
+                        }
+                        if entry.has_trailing_newline {
+                            entry_builder.add_trailing_newline();
+                            entry_builder.flush_to_index(&mut index);
                         }
                         continue;
                     }
@@ -872,6 +901,47 @@ impl EntryBuilder {
             && !self.has_trailing_newline
             && !self.ends_with_leading_wide_char_spacer
             && self.grapheme_runs.is_empty()
+    }
+
+    /// Flushes the current entry to the index and resets in-place,
+    /// preserving Vec capacity to avoid reallocation.
+    fn flush_to_index(&mut self, index: &mut Index) {
+        #[cfg(debug_assertions)]
+        {
+            self.was_processed = true;
+        }
+
+        let content_offset = index.content_len.into();
+
+        let grapheme_sizing = if self.grapheme_runs.len() == 1 {
+            GraphemeSizing::Uniform(
+                unsafe { self.grapheme_runs.pop().unwrap_unchecked() },
+            )
+        } else if self.grapheme_runs.is_empty() {
+            GraphemeSizing::EmptyRow
+        } else {
+            let runs = std::mem::take(&mut self.grapheme_runs);
+            index.grapheme_sizing.insert(content_offset, runs);
+            GraphemeSizing::NonUniform
+        };
+
+        index.content_len += self.incr_content_offset.as_usize();
+        index.rows.push_back(Entry {
+            content_offset,
+            grapheme_sizing,
+            has_trailing_newline: self.has_trailing_newline,
+            ends_with_leading_wide_char_spacer: self.ends_with_leading_wide_char_spacer,
+        });
+
+        // Reset in-place, preserving grapheme_runs capacity
+        self.num_cells = 0;
+        self.incr_content_offset = ByteOffset::zero();
+        self.has_trailing_newline = false;
+        self.ends_with_leading_wide_char_spacer = false;
+        #[cfg(debug_assertions)]
+        {
+            self.was_processed = false;
+        }
     }
 }
 
