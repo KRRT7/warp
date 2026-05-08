@@ -148,7 +148,7 @@ impl CLIAgentSession {
         self.remote_host.is_some()
     }
 
-    pub fn apply_event(&mut self, event: &CLIAgentEvent) -> Option<CLIAgentSessionStatus> {
+    pub(crate) fn apply_event(&mut self, event: &CLIAgentEvent) -> Option<CLIAgentSessionStatus> {
         self.session_context.cwd = event.cwd.clone().or(self.session_context.cwd.take());
         self.session_context.project = event
             .project
