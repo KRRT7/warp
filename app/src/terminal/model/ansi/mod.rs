@@ -497,8 +497,8 @@ impl Processor {
                 while idx < bytes.len() {
                     if parser.is_ground_state() {
                         let b = bytes[idx];
-                        if b >= 0x20 && b <= 0x7E {
-                            // Printable ASCII: bulk-scan with SIMD
+                        match b {
+                        0x20..=0x7E => {
                             let remaining = &bytes[idx..];
                             let ascii_len = ascii_printable_prefix_len(remaining);
                             let ascii_run = &bytes[idx..idx + ascii_len];
@@ -509,7 +509,8 @@ impl Processor {
                                 Some(ascii_run[ascii_run.len() - 1] as char);
                             idx += ascii_len;
                             continue;
-                        } else if b == 0x1b {
+                        }
+                        0x1b => {
                             // Escape: try CSI fast-scan, then ESC dispatch
                             if idx + 1 < bytes.len() {
                                 let next = bytes[idx + 1];
@@ -681,28 +682,29 @@ impl Processor {
                                 }
                             }
                             // Fall through to VTE for incomplete/complex escapes
-                        } else if b == 0x0A || b == 0x0B || b == 0x0C {
-                            // LF/VT/FF: linefeed
+                        }
+                        0x0A | 0x0B | 0x0C => {
                             performer.handler.linefeed();
                             idx += 1;
                             continue;
-                        } else if b == 0x0D {
-                            // CR: carriage return
+                        }
+                        0x0D => {
                             performer.handler.carriage_return();
                             idx += 1;
                             continue;
-                        } else if b == 0x08 {
-                            // BS: backspace
+                        }
+                        0x08 => {
                             performer.handler.backspace();
                             idx += 1;
                             continue;
-                        } else if b == 0x09 {
-                            // HT: horizontal tab
+                        }
+                        0x09 => {
                             performer.handler.put_tab(1);
                             idx += 1;
                             continue;
                         }
-                        // Other control chars or non-ASCII: fall through to VTE
+                        _ => {}
+                        }
                     }
 
                     let was_sync_output = performer.state.sync_output.is_active();
