@@ -365,6 +365,67 @@ impl Default for Processor {
     }
 }
 
+/// Returns the length of the longest prefix of `bytes` that is ASCII printable (0x20..=0x7E).
+/// Uses SIMD (SSE2) on x86_64 for 16-byte-at-a-time scanning.
+#[inline]
+fn ascii_printable_prefix_len(bytes: &[u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        unsafe {
+            let len = bytes.len();
+            let ptr = bytes.as_ptr();
+            let mut i = 0;
+
+            // Trick: subtract 0x20 from each byte (wrapping), then check if result > 0x5E.
+            // Bytes in [0x20, 0x7E] map to [0x00, 0x5E] — all <= 0x5E.
+            // Bytes < 0x20 underflow to [0xE0, 0xFF] — all > 0x5E.
+            // Bytes > 0x7E map to [0x5F, 0xBF] — all > 0x5E (except 0x7F maps to 0x5F).
+            // For signed cmpgt: bias to signed range.
+            let bias = _mm_set1_epi8(-0x20i8);
+            // 0x5E as signed i8 = 94 which fits in i8
+            let threshold = _mm_set1_epi8(0x5Ei8);
+
+            while i + 16 <= len {
+                let chunk = _mm_loadu_si128(ptr.add(i) as *const __m128i);
+                // Subtract 0x20 (add -0x20)
+                let biased = _mm_add_epi8(chunk, bias);
+                // Compare: biased > 0x5E (signed). This catches bytes outside [0x20, 0x7E].
+                // But we need unsigned comparison. Use the standard trick:
+                // flip sign bits on both operands to convert signed cmpgt to unsigned cmpgt.
+                let sign_flip = _mm_set1_epi8(i8::MIN);
+                let non_printable = _mm_cmpgt_epi8(
+                    _mm_xor_si128(biased, sign_flip),
+                    _mm_xor_si128(threshold, sign_flip),
+                );
+                let mask = _mm_movemask_epi8(non_printable);
+                if mask != 0 {
+                    return i + mask.trailing_zeros() as usize;
+                }
+                i += 16;
+            }
+
+            // Scalar tail
+            while i < len {
+                let b = *ptr.add(i);
+                if b < 0x20 || b > 0x7E {
+                    return i;
+                }
+                i += 1;
+            }
+            len
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        bytes
+            .iter()
+            .position(|&b| b < 0x20 || b > 0x7E)
+            .unwrap_or(bytes.len())
+    }
+}
+
 impl Processor {
     pub fn new() -> Processor {
         Default::default()
@@ -436,10 +497,7 @@ impl Processor {
                 while idx < bytes.len() {
                     if parser.is_ground_state() {
                         let remaining = &bytes[idx..];
-                        let ascii_len = remaining
-                            .iter()
-                            .position(|&b| b < 0x20 || b > 0x7E)
-                            .unwrap_or(remaining.len());
+                        let ascii_len = ascii_printable_prefix_len(remaining);
                         if ascii_len > 0 {
                             let ascii_run = &bytes[idx..idx + ascii_len];
                             for &b in ascii_run {

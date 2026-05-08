@@ -119,27 +119,29 @@ impl Index {
                 .get_entry(row_idx)
                 .expect("row should have an entry");
 
-            // Fast path: narrowing Uniform ASCII rows with arithmetic split
+            // Fast path: narrowing Uniform rows with arithmetic split
             if entry_builder.is_empty() && entry.has_trailing_newline {
                 if let GraphemeSizing::Uniform(run) = &entry.grapheme_sizing {
                     let row_cells = run.cols();
-                    if row_cells > columns && run.info.cell_width == 1 {
+                    let cell_width = run.info.cell_width as usize;
+                    if row_cells > columns && cell_width > 0 && columns >= cell_width {
+                        let graphemes_per_row = columns / cell_width;
                         let count = run.count.get() as usize;
                         let byte_len = run.info.utf8_bytes.get() as usize;
                         let mut rem = count;
-                        while rem > columns {
+                        while rem > graphemes_per_row {
                             let content_offset: ByteOffset = index.content_len.into();
-                            index.content_len += columns * byte_len;
+                            index.content_len += graphemes_per_row * byte_len;
                             index.rows.push_back(Entry {
                                 content_offset,
                                 grapheme_sizing: GraphemeSizing::Uniform(GraphemeRun {
-                                    count: NonZeroU16::new(columns as u16).unwrap(),
+                                    count: NonZeroU16::new(graphemes_per_row as u16).unwrap(),
                                     info: run.info,
                                 }),
                                 has_trailing_newline: false,
                                 ends_with_leading_wide_char_spacer: false,
                             });
-                            rem -= columns;
+                            rem -= graphemes_per_row;
                         }
                         // Last partial row with newline
                         let content_offset: ByteOffset = index.content_len.into();
