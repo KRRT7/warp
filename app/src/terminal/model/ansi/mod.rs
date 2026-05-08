@@ -494,8 +494,9 @@ impl Processor {
 
                 let mut performer = Performer::new(state, handler, writer);
                 let mut idx = 0;
+                let mut in_ground = parser.is_ground_state();
                 while idx < bytes.len() {
-                    if parser.is_ground_state() {
+                    if in_ground {
                         let b = bytes[idx];
                         match b {
                         0x20..=0x7E => {
@@ -707,9 +708,11 @@ impl Processor {
                         }
                     }
 
+                    in_ground = false;
                     let was_sync_output = performer.state.sync_output.is_active();
                     parser.advance(&mut performer, bytes[idx]);
                     let is_sync_output = performer.state.sync_output.is_active();
+                    in_ground = parser.is_ground_state();
 
                     if performer.state.tmux_control_mode.is_some()
                         || was_sync_output != is_sync_output
