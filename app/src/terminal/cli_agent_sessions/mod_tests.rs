@@ -422,3 +422,143 @@ fn session_start_without_plugin_version_leaves_none() {
     session.apply_event(&event);
     assert_eq!(session.plugin_version, None);
 }
+
+fn make_test_event(event_type: CLIAgentEventType) -> CLIAgentEvent {
+    CLIAgentEvent {
+        v: 1,
+        agent: CLIAgent::Claude,
+        event: event_type,
+        session_id: Some("test-session".to_string()),
+        cwd: Some("/tmp/proj".to_string()),
+        project: Some("proj".to_string()),
+        payload: CLIAgentEventPayload {
+            summary: Some("Run command".to_string()),
+            tool_name: Some("Bash".to_string()),
+            ..Default::default()
+        },
+    }
+}
+
+fn make_test_session() -> CLIAgentSession {
+    CLIAgentSession {
+        agent: CLIAgent::Claude,
+        status: CLIAgentSessionStatus::InProgress,
+        session_context: CLIAgentSessionContext::default(),
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        plugin_version: None,
+        draft_text: None,
+        remote_host: None,
+        custom_command_prefix: None,
+    }
+}
+
+#[test]
+fn tool_complete_from_blocked_returns_none_but_updates_status() {
+    let mut session = make_test_session();
+    session.status = CLIAgentSessionStatus::Blocked {
+        message: Some("Needs approval".to_string()),
+    };
+
+    let result = session.apply_event(&make_test_event(CLIAgentEventType::ToolComplete));
+
+    assert!(result.is_none(), "ToolComplete should not emit a status change");
+    assert_eq!(session.status, CLIAgentSessionStatus::InProgress);
+}
+
+#[test]
+fn tool_complete_from_in_progress_is_noop() {
+    let mut session = make_test_session();
+
+    let result = session.apply_event(&make_test_event(CLIAgentEventType::ToolComplete));
+
+    assert!(result.is_none());
+    assert_eq!(session.status, CLIAgentSessionStatus::InProgress);
+}
+
+#[test]
+fn permission_replied_from_blocked_returns_none_but_updates_status() {
+    let mut session = make_test_session();
+    session.status = CLIAgentSessionStatus::Blocked {
+        message: Some("Waiting for answer".to_string()),
+    };
+
+    let result = session.apply_event(&make_test_event(CLIAgentEventType::PermissionReplied));
+
+    assert!(result.is_none(), "PermissionReplied should not emit a status change");
+    assert_eq!(session.status, CLIAgentSessionStatus::InProgress);
+}
+
+#[test]
+fn permission_replied_from_in_progress_is_noop() {
+    let mut session = make_test_session();
+
+    let result = session.apply_event(&make_test_event(CLIAgentEventType::PermissionReplied));
+
+    assert!(result.is_none());
+    assert_eq!(session.status, CLIAgentSessionStatus::InProgress);
+}
+
+#[test]
+fn permission_request_still_emits_status_change() {
+    let mut session = make_test_session();
+
+    let result = session.apply_event(&make_test_event(CLIAgentEventType::PermissionRequest));
+
+    assert!(result.is_some(), "PermissionRequest should emit Blocked");
+    assert!(matches!(session.status, CLIAgentSessionStatus::Blocked { .. }));
+}
+
+#[test]
+fn full_session_flicker_count_is_reduced() {
+    let mut session = make_test_session();
+    let mut transitions = 0u32;
+
+    if session
+        .apply_event(&make_test_event(CLIAgentEventType::PromptSubmit))
+        .is_some()
+    {
+        transitions += 1;
+    }
+
+    for _ in 0..20 {
+        if session
+            .apply_event(&make_test_event(CLIAgentEventType::PermissionRequest))
+            .is_some()
+        {
+            transitions += 1;
+        }
+        if session
+            .apply_event(&make_test_event(CLIAgentEventType::ToolComplete))
+            .is_some()
+        {
+            transitions += 1;
+        }
+    }
+
+    if session
+        .apply_event(&make_test_event(CLIAgentEventType::Stop))
+        .is_some()
+    {
+        transitions += 1;
+    }
+
+    // Before fix: 42 transitions (1 + 20*2 + 1)
+    // After fix: 22 transitions (1 + 20*1 + 1) — only PromptSubmit, PermissionRequests, Stop
+    assert_eq!(transitions, 22);
+}
+
+#[test]
+fn stop_still_emits_after_tool_complete_suppression() {
+    let mut session = make_test_session();
+
+    session.apply_event(&make_test_event(CLIAgentEventType::PromptSubmit));
+    session.apply_event(&make_test_event(CLIAgentEventType::PermissionRequest));
+    session.apply_event(&make_test_event(CLIAgentEventType::ToolComplete));
+
+    let result = session.apply_event(&make_test_event(CLIAgentEventType::Stop));
+
+    assert!(result.is_some());
+    assert_eq!(session.status, CLIAgentSessionStatus::Success);
+}

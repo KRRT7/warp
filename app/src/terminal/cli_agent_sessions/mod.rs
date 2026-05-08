@@ -148,9 +148,7 @@ impl CLIAgentSession {
         self.remote_host.is_some()
     }
 
-    /// Applies an event to this session, updating context and status.
-    /// Returns the new status if it changed, or `None` if the event was irrelevant.
-    fn apply_event(&mut self, event: &CLIAgentEvent) -> Option<CLIAgentSessionStatus> {
+    pub fn apply_event(&mut self, event: &CLIAgentEvent) -> Option<CLIAgentSessionStatus> {
         self.session_context.cwd = event.cwd.clone().or(self.session_context.cwd.take());
         self.session_context.project = event
             .project
@@ -168,10 +166,10 @@ impl CLIAgentSession {
                 CLIAgentSessionStatus::InProgress
             }
             CLIAgentEventType::ToolComplete => {
-                if !matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
-                    return None;
+                if matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
+                    self.status = CLIAgentSessionStatus::InProgress;
                 }
-                CLIAgentSessionStatus::InProgress
+                return None;
             }
             CLIAgentEventType::Stop => {
                 self.session_context.query = event.payload.query.clone();
@@ -194,10 +192,10 @@ impl CLIAgentSession {
                     .or_else(|| Some("Waiting for your answer".to_owned())),
             },
             CLIAgentEventType::PermissionReplied => {
-                if !matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
-                    return None;
+                if matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
+                    self.status = CLIAgentSessionStatus::InProgress;
                 }
-                CLIAgentSessionStatus::InProgress
+                return None;
             }
             // IdlePrompt means the agent is sitting at its prompt waiting for input.
             // This should not affect status — otherwise it would override Success after a Stop event.
@@ -389,7 +387,6 @@ impl CLIAgentSessionsModel {
             return;
         };
 
-        let event_type = &event.event;
         if let Some(new_status) = session.apply_event(event) {
             let agent = session.agent;
             ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
@@ -401,7 +398,7 @@ impl CLIAgentSessionsModel {
         }
 
         if matches!(
-            event_type,
+            event.event,
             CLIAgentEventType::SessionStart
                 | CLIAgentEventType::PromptSubmit
                 | CLIAgentEventType::ToolComplete
