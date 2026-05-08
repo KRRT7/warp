@@ -533,7 +533,59 @@ mod bench {
     }
 
     #[test]
-    fn bench_baseline_softwrapped() {
+    #[test]
+    fn bench_ab_softwrapped() {
+        let mut index = Index::new(80, Some(5000));
+        let info = GraphemeInfo { cell_width: 1, utf8_bytes: NonZeroU16::new(1).unwrap() };
+        for i in 0..5000 {
+            let mut eb = index.start_row();
+            for _ in 0..80 {
+                eb.process_grapheme_info(info, &mut index);
+            }
+            if i % 5 == 4 {
+                eb.add_trailing_newline();
+            }
+            eb.append_to_index(&mut index);
+        }
+
+        let rounds = 4;
+        let iters = 50;
+        let mut opt_times = Vec::new();
+        let mut base_times = Vec::new();
+
+        for round in 0..rounds {
+            // Optimized
+            {
+                for _ in 0..3 { let _ = black_box(Index::rebuild(&index, 60)); }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let _ = black_box(Index::rebuild(black_box(&index), 60));
+                }
+                opt_times.push(start.elapsed() / iters);
+            }
+            // Baseline
+            {
+                for _ in 0..3 { let _ = black_box(Index::rebuild_baseline(&index, 60)); }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let _ = black_box(Index::rebuild_baseline(black_box(&index), 60));
+                }
+                base_times.push(start.elapsed() / iters);
+            }
+            eprintln!("  Round {}: opt={:?}, base={:?}", round+1, opt_times.last().unwrap(), base_times.last().unwrap());
+        }
+
+        let opt_avg: std::time::Duration = opt_times.iter().sum::<std::time::Duration>() / rounds;
+        let base_avg: std::time::Duration = base_times.iter().sum::<std::time::Duration>() / rounds;
+        let speedup = base_avg.as_nanos() as f64 / opt_avg.as_nanos() as f64;
+        eprintln!("\nA/B SOFTWRAPPED:");
+        eprintln!("  Optimized: {:?}/iter", opt_avg);
+        eprintln!("  Baseline:  {:?}/iter", base_avg);
+        eprintln!("  Speedup:   {:.1}x", speedup);
+    }
+
+    #[test]
+        fn bench_baseline_softwrapped() {
         let mut index = Index::new(80, Some(5000));
         let info = GraphemeInfo { cell_width: 1, utf8_bytes: NonZeroU16::new(1).unwrap() };
         for i in 0..5000 {
