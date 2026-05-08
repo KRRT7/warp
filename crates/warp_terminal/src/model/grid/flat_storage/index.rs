@@ -259,6 +259,53 @@ impl Index {
                     let remaining_graphemes = remaining_cells / cell_width;
                     let graphemes_per_row = columns / cell_width;
 
+                    // If builder is exactly full, flush it first
+                    if remaining_graphemes == 0 && entry_builder.num_cells >= columns
+                        && graphemes_per_row > 0
+                    {
+                        entry_builder.flush_to_index(&mut index);
+                        // Now treat this row as if builder were empty
+                        let remaining_graphemes = graphemes_per_row;
+                        if count > remaining_graphemes {
+                            // Same arithmetic split logic
+                            entry_builder.num_cells = remaining_graphemes * cell_width;
+                            entry_builder.incr_content_offset += remaining_graphemes * byte_len;
+                            entry_builder.grapheme_runs.push(GraphemeRun {
+                                count: NonZeroU16::new(remaining_graphemes as u16).unwrap(),
+                                info: run.info,
+                            });
+                            entry_builder.flush_to_index(&mut index);
+                            let mut rem = count - remaining_graphemes;
+                            while rem >= graphemes_per_row {
+                                let content_offset: ByteOffset = index.content_len.into();
+                                index.content_len += graphemes_per_row * byte_len;
+                                index.rows.push_back(Entry {
+                                    content_offset,
+                                    grapheme_sizing: GraphemeSizing::Uniform(GraphemeRun {
+                                        count: NonZeroU16::new(graphemes_per_row as u16).unwrap(),
+                                        info: run.info,
+                                    }),
+                                    has_trailing_newline: false,
+                                    ends_with_leading_wide_char_spacer: false,
+                                });
+                                rem -= graphemes_per_row;
+                            }
+                            if rem > 0 {
+                                entry_builder.num_cells = rem * cell_width;
+                                entry_builder.incr_content_offset += rem * byte_len;
+                                entry_builder.grapheme_runs.push(GraphemeRun {
+                                    count: NonZeroU16::new(rem as u16).unwrap(),
+                                    info: run.info,
+                                });
+                            }
+                            if entry.has_trailing_newline {
+                                entry_builder.add_trailing_newline();
+                                entry_builder.flush_to_index(&mut index);
+                            }
+                            continue;
+                        }
+                    }
+
                     if remaining_graphemes > 0 && remaining_graphemes < count
                         && graphemes_per_row > 0
                     {
@@ -282,7 +329,7 @@ impl Index {
 
                         // Process remaining graphemes with arithmetic
                         let mut rem = count - remaining_graphemes;
-                        while rem > graphemes_per_row {
+                        while rem >= graphemes_per_row {
                             let content_offset: ByteOffset = index.content_len.into();
                             index.content_len += graphemes_per_row * byte_len;
                             index.rows.push_back(Entry {
