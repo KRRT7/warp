@@ -588,6 +588,21 @@ impl Processor {
                         }
                     }
 
+                    // ESC dispatch fast path: 2-byte sequences (ESC + 0x40..=0x5F)
+                    if parser.is_ground_state() && bytes[idx] == 0x1b
+                        && idx + 1 < bytes.len()
+                    {
+                        let next = bytes[idx + 1];
+                        if (0x40..=0x5F).contains(&next) && next != b'[' && next != b']'
+                            && next != b'P' && next != b'X' && next != b'^' && next != b'_'
+                        {
+                            // Simple 2-byte ESC sequence: dispatch directly
+                            performer.esc_dispatch(&[], false, next);
+                            idx += 2;
+                            continue;
+                        }
+                    }
+
                     let was_sync_output = performer.state.sync_output.is_active();
                     parser.advance(&mut performer, bytes[idx]);
                     let is_sync_output = performer.state.sync_output.is_active();

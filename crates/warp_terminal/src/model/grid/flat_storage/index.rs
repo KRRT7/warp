@@ -758,6 +758,13 @@ impl EntryBuilder {
         Default::default()
     }
 
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            grapheme_runs: Vec::with_capacity(cap),
+            ..Default::default()
+        }
+    }
+
     /// Processes the next [`Grapheme`] in the row.
     pub fn process_grapheme(&mut self, grapheme: &Grapheme, index: &mut Index) {
         if grapheme.starts_new_row() {
