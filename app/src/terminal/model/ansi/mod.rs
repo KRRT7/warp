@@ -681,8 +681,28 @@ impl Processor {
                                 }
                             }
                             // Fall through to VTE for incomplete/complex escapes
+                        } else if b == 0x0A || b == 0x0B || b == 0x0C {
+                            // LF/VT/FF: linefeed
+                            performer.handler.linefeed();
+                            idx += 1;
+                            continue;
+                        } else if b == 0x0D {
+                            // CR: carriage return
+                            performer.handler.carriage_return();
+                            idx += 1;
+                            continue;
+                        } else if b == 0x08 {
+                            // BS: backspace
+                            performer.handler.backspace();
+                            idx += 1;
+                            continue;
+                        } else if b == 0x09 {
+                            // HT: horizontal tab
+                            performer.handler.put_tab(1);
+                            idx += 1;
+                            continue;
                         }
-                        // Control chars or non-ASCII in ground state: fall through to VTE
+                        // Other control chars or non-ASCII: fall through to VTE
                     }
 
                     let was_sync_output = performer.state.sync_output.is_active();
