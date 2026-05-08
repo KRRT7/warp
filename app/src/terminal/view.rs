@@ -123,7 +123,7 @@ use crate::code_review::comments::{
     convert_insert_review_comments, AttachedReviewComment, PendingImportedReviewComment,
 };
 #[cfg(feature = "local_fs")]
-use crate::code_review::diff_state::DiffStateModel;
+use crate::code_review::diff_state::LocalDiffStateModel;
 use crate::code_review::diff_state::{DiffMode, GitDeltaPreference};
 #[cfg(feature = "local_fs")]
 use crate::code_review::git_status_update::{
@@ -4500,7 +4500,8 @@ impl TerminalView {
                     | RemoteServerManagerEvent::RepoMetadataUpdated { .. }
                     | RemoteServerManagerEvent::RepoMetadataDirectoryLoaded { .. }
                     | RemoteServerManagerEvent::CodebaseIndexStatusesSnapshot { .. }
-                    | RemoteServerManagerEvent::CodebaseIndexStatusUpdated { .. } => {}
+                    | RemoteServerManagerEvent::CodebaseIndexStatusUpdated { .. }
+                    | RemoteServerManagerEvent::BufferUpdated { .. } => {}
                 }
             });
         }
@@ -6177,7 +6178,7 @@ impl TerminalView {
         let diff_mode_clone = diff_mode.clone();
         let repo_path_clone = repo_path.clone();
         let future = async move {
-            DiffStateModel::load_diff_data_for_mode(diff_mode_clone, repo_path_clone).await
+            LocalDiffStateModel::load_diff_data_for_mode(diff_mode_clone, repo_path_clone).await
         };
 
         ctx.spawn(future, move |_me, git_diff_data_opt, ctx| {
@@ -6970,23 +6971,21 @@ impl TerminalView {
             return;
         };
 
-        if task.is_no_longer_running() {
-            if self.pending_cloud_followup_task_id == Some(task_id) {
-                return;
-            }
-            if self.owned_ambient_agent_task_id(ctx).is_some() {
-                if FeatureFlag::HandoffCloudCloud.is_enabled()
-                    && !self
-                        .model
-                        .lock()
-                        .shared_session_status()
-                        .is_sharer_or_viewer()
-                {
-                    self.enable_owned_cloud_followup_input(task_id, ctx);
-                }
-                return;
-            }
+        if !task.is_no_longer_running() || self.pending_cloud_followup_task_id == Some(task_id) {
+            return;
+        }
+
+        let can_continue_owned_task_in_cloud = self.owned_ambient_agent_task_id(ctx).is_some()
+            && FeatureFlag::HandoffCloudCloud.is_enabled();
+        if !can_continue_owned_task_in_cloud {
             self.insert_conversation_ended_tombstone(ctx);
+        } else if !self
+            .model
+            .lock()
+            .shared_session_status()
+            .is_sharer_or_viewer()
+        {
+            self.enable_owned_cloud_followup_input(task_id, ctx)
         }
     }
 
