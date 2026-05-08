@@ -1016,6 +1016,191 @@ mod bench {
         );
     }
 
+    #[test]
+    fn bench_ab_escape_heavy() {
+        // A/B/A/B pattern: alternates optimized vs baseline to filter VM noise
+        let seq = b"\x1b[1;1H\x1b[31mX";
+        let data: Vec<u8> = seq.repeat(65536);
+        let iters = 20;
+        let rounds = 4;
+
+        let mut optimized_times = Vec::new();
+        let mut baseline_times = Vec::new();
+
+        for round in 0..rounds {
+            // Optimized (parse_bytes path)
+            {
+                let mut processor = Processor::default();
+                let mut handler = MockHandler::default();
+                let mut writer = io::sink();
+                for _ in 0..3 {
+                    processor.parse_bytes(&mut handler, &data, &mut writer);
+                }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    processor.parse_bytes(black_box(&mut handler), black_box(&data), &mut writer);
+                }
+                optimized_times.push(start.elapsed() / iters);
+            }
+
+            // Baseline (byte-at-a-time VTE path)
+            {
+                let mut processor = Processor::default();
+                let mut handler = MockHandler::default();
+                let mut writer = io::sink();
+                // Warmup
+                for _ in 0..3 {
+                    for &byte in data.iter() {
+                        processor.parse_byte(&mut handler, &mut writer, byte);
+                    }
+                }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    for &byte in black_box(&data).iter() {
+                        processor.parse_byte(black_box(&mut handler), &mut writer, *black_box(&byte));
+                    }
+                }
+                baseline_times.push(start.elapsed() / iters);
+            }
+
+            eprintln!("  Round {}: optimized={:?}, baseline={:?}",
+                round + 1,
+                optimized_times.last().unwrap(),
+                baseline_times.last().unwrap());
+        }
+
+        let opt_avg: std::time::Duration = optimized_times.iter().sum::<std::time::Duration>() / rounds;
+        let base_avg: std::time::Duration = baseline_times.iter().sum::<std::time::Duration>() / rounds;
+        let speedup = base_avg.as_nanos() as f64 / opt_avg.as_nanos() as f64;
+        let throughput_opt = (data.len() as f64) / opt_avg.as_secs_f64() / 1e9;
+        let throughput_base = (data.len() as f64) / base_avg.as_secs_f64() / 1e9;
+        eprintln!("\nA/B ESCAPE-HEAVY ({}B payload):", data.len());
+        eprintln!("  Optimized: {:?}/iter ({:.3} GB/s)", opt_avg, throughput_opt);
+        eprintln!("  Baseline:  {:?}/iter ({:.3} GB/s)", base_avg, throughput_base);
+        eprintln!("  Speedup:   {:.2}x", speedup);
+    }
+
+    #[test]
+    fn bench_ab_pure_ascii() {
+        let data: Vec<u8> = (0..1_048_576).map(|i| b'A' + (i % 26) as u8).collect();
+        let iters = 20;
+        let rounds = 4;
+
+        let mut optimized_times = Vec::new();
+        let mut baseline_times = Vec::new();
+
+        for round in 0..rounds {
+            // Optimized
+            {
+                let mut processor = Processor::default();
+                let mut handler = MockHandler::default();
+                let mut writer = io::sink();
+                for _ in 0..3 {
+                    processor.parse_bytes(&mut handler, &data, &mut writer);
+                }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    processor.parse_bytes(black_box(&mut handler), black_box(&data), &mut writer);
+                }
+                optimized_times.push(start.elapsed() / iters);
+            }
+
+            // Baseline
+            {
+                let mut processor = Processor::default();
+                let mut handler = MockHandler::default();
+                let mut writer = io::sink();
+                for _ in 0..3 {
+                    for &byte in data.iter() {
+                        processor.parse_byte(&mut handler, &mut writer, byte);
+                    }
+                }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    for &byte in black_box(&data).iter() {
+                        processor.parse_byte(black_box(&mut handler), &mut writer, *black_box(&byte));
+                    }
+                }
+                baseline_times.push(start.elapsed() / iters);
+            }
+
+            eprintln!("  Round {}: optimized={:?}, baseline={:?}",
+                round + 1,
+                optimized_times.last().unwrap(),
+                baseline_times.last().unwrap());
+        }
+
+        let opt_avg: std::time::Duration = optimized_times.iter().sum::<std::time::Duration>() / rounds;
+        let base_avg: std::time::Duration = baseline_times.iter().sum::<std::time::Duration>() / rounds;
+        let speedup = base_avg.as_nanos() as f64 / opt_avg.as_nanos() as f64;
+        let throughput_opt = (data.len() as f64) / opt_avg.as_secs_f64() / 1e9;
+        let throughput_base = (data.len() as f64) / base_avg.as_secs_f64() / 1e9;
+        eprintln!("\nA/B PURE-ASCII ({}B payload):", data.len());
+        eprintln!("  Optimized: {:?}/iter ({:.3} GB/s)", opt_avg, throughput_opt);
+        eprintln!("  Baseline:  {:?}/iter ({:.3} GB/s)", base_avg, throughput_base);
+        eprintln!("  Speedup:   {:.2}x", speedup);
+    }
+
+    #[test]
+    fn bench_ab_mixed() {
+        let chunk = b"Hello \x1b[1;32mWorld\x1b[0m! Line with \x1b[38;5;196mcolor\x1b[0m\r\n";
+        let data: Vec<u8> = chunk.repeat(1_048_576 / chunk.len());
+        let iters = 20;
+        let rounds = 4;
+
+        let mut optimized_times = Vec::new();
+        let mut baseline_times = Vec::new();
+
+        for round in 0..rounds {
+            {
+                let mut processor = Processor::default();
+                let mut handler = MockHandler::default();
+                let mut writer = io::sink();
+                for _ in 0..3 {
+                    processor.parse_bytes(&mut handler, &data, &mut writer);
+                }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    processor.parse_bytes(black_box(&mut handler), black_box(&data), &mut writer);
+                }
+                optimized_times.push(start.elapsed() / iters);
+            }
+
+            {
+                let mut processor = Processor::default();
+                let mut handler = MockHandler::default();
+                let mut writer = io::sink();
+                for _ in 0..3 {
+                    for &byte in data.iter() {
+                        processor.parse_byte(&mut handler, &mut writer, byte);
+                    }
+                }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    for &byte in black_box(&data).iter() {
+                        processor.parse_byte(black_box(&mut handler), &mut writer, *black_box(&byte));
+                    }
+                }
+                baseline_times.push(start.elapsed() / iters);
+            }
+
+            eprintln!("  Round {}: optimized={:?}, baseline={:?}",
+                round + 1,
+                optimized_times.last().unwrap(),
+                baseline_times.last().unwrap());
+        }
+
+        let opt_avg: std::time::Duration = optimized_times.iter().sum::<std::time::Duration>() / rounds;
+        let base_avg: std::time::Duration = baseline_times.iter().sum::<std::time::Duration>() / rounds;
+        let speedup = base_avg.as_nanos() as f64 / opt_avg.as_nanos() as f64;
+        let throughput_opt = (data.len() as f64) / opt_avg.as_secs_f64() / 1e9;
+        let throughput_base = (data.len() as f64) / base_avg.as_secs_f64() / 1e9;
+        eprintln!("\nA/B MIXED ({}B payload):", data.len());
+        eprintln!("  Optimized: {:?}/iter ({:.3} GB/s)", opt_avg, throughput_opt);
+        eprintln!("  Baseline:  {:?}/iter ({:.3} GB/s)", base_avg, throughput_base);
+        eprintln!("  Speedup:   {:.2}x", speedup);
+    }
+
 }
 
 
