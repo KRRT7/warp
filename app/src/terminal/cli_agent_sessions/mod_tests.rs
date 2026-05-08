@@ -455,7 +455,7 @@ fn make_test_session() -> CLIAgentSession {
 }
 
 #[test]
-fn tool_complete_from_blocked_returns_none_but_updates_status() {
+fn tool_complete_from_blocked_returns_none_and_preserves_status() {
     let mut session = make_test_session();
     session.status = CLIAgentSessionStatus::Blocked {
         message: Some("Needs approval".to_string()),
@@ -463,8 +463,14 @@ fn tool_complete_from_blocked_returns_none_but_updates_status() {
 
     let result = session.apply_event(&make_test_event(CLIAgentEventType::ToolComplete));
 
-    assert!(result.is_none(), "ToolComplete should not emit a status change");
-    assert_eq!(session.status, CLIAgentSessionStatus::InProgress);
+    assert!(
+        result.is_none(),
+        "ToolComplete should not emit a status change"
+    );
+    assert!(matches!(
+        session.status,
+        CLIAgentSessionStatus::Blocked { .. }
+    ));
 }
 
 #[test]
@@ -478,7 +484,7 @@ fn tool_complete_from_in_progress_is_noop() {
 }
 
 #[test]
-fn permission_replied_from_blocked_returns_none_but_updates_status() {
+fn permission_replied_from_blocked_emits_in_progress() {
     let mut session = make_test_session();
     session.status = CLIAgentSessionStatus::Blocked {
         message: Some("Waiting for answer".to_string()),
@@ -486,7 +492,7 @@ fn permission_replied_from_blocked_returns_none_but_updates_status() {
 
     let result = session.apply_event(&make_test_event(CLIAgentEventType::PermissionReplied));
 
-    assert!(result.is_none(), "PermissionReplied should not emit a status change");
+    assert!(result.is_some(), "PermissionReplied should emit InProgress");
     assert_eq!(session.status, CLIAgentSessionStatus::InProgress);
 }
 
@@ -507,7 +513,10 @@ fn permission_request_still_emits_status_change() {
     let result = session.apply_event(&make_test_event(CLIAgentEventType::PermissionRequest));
 
     assert!(result.is_some(), "PermissionRequest should emit Blocked");
-    assert!(matches!(session.status, CLIAgentSessionStatus::Blocked { .. }));
+    assert!(matches!(
+        session.status,
+        CLIAgentSessionStatus::Blocked { .. }
+    ));
 }
 
 #[test]
@@ -564,7 +573,7 @@ fn stop_still_emits_after_tool_complete_suppression() {
 }
 
 #[test]
-fn question_asked_then_permission_replied_suppresses_flicker() {
+fn question_asked_then_permission_replied_emits_correctly() {
     let mut session = make_test_session();
     let mut transitions = 0u32;
 
@@ -587,10 +596,11 @@ fn question_asked_then_permission_replied_suppresses_flicker() {
         CLIAgentSessionStatus::Blocked { .. }
     ));
 
-    // PermissionReplied updates internal state but does NOT emit
+    // PermissionReplied emits InProgress (user answered — meaningful transition)
     let result = session.apply_event(&make_test_event(CLIAgentEventType::PermissionReplied));
-    assert!(result.is_none());
+    assert!(result.is_some());
     assert_eq!(session.status, CLIAgentSessionStatus::InProgress);
+    transitions += 1;
 
     // Another permission-gated tool
     if session
@@ -599,12 +609,17 @@ fn question_asked_then_permission_replied_suppresses_flicker() {
     {
         transitions += 1;
     }
+    // ToolComplete does NOT emit and does NOT change status
     if session
         .apply_event(&make_test_event(CLIAgentEventType::ToolComplete))
         .is_some()
     {
         transitions += 1;
     }
+    assert!(matches!(
+        session.status,
+        CLIAgentSessionStatus::Blocked { .. }
+    ));
 
     if session
         .apply_event(&make_test_event(CLIAgentEventType::Stop))
@@ -613,7 +628,7 @@ fn question_asked_then_permission_replied_suppresses_flicker() {
         transitions += 1;
     }
 
-    // PromptSubmit + QuestionAsked(Blocked) + PermissionRequest(Blocked) + Stop = 4
-    // PermissionReplied and ToolComplete are suppressed
-    assert_eq!(transitions, 4);
+    // PromptSubmit + QuestionAsked(Blocked) + PermissionReplied(InProgress) + PermissionRequest(Blocked) + Stop = 5
+    // Only ToolComplete is suppressed
+    assert_eq!(transitions, 5);
 }

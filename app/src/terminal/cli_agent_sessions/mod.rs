@@ -166,9 +166,6 @@ impl CLIAgentSession {
                 CLIAgentSessionStatus::InProgress
             }
             CLIAgentEventType::ToolComplete => {
-                if matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
-                    self.status = CLIAgentSessionStatus::InProgress;
-                }
                 return None;
             }
             CLIAgentEventType::Stop => {
@@ -192,10 +189,10 @@ impl CLIAgentSession {
                     .or_else(|| Some("Waiting for your answer".to_owned())),
             },
             CLIAgentEventType::PermissionReplied => {
-                if matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
-                    self.status = CLIAgentSessionStatus::InProgress;
+                if !matches!(self.status, CLIAgentSessionStatus::Blocked { .. }) {
+                    return None;
                 }
-                return None;
+                CLIAgentSessionStatus::InProgress
             }
             // IdlePrompt means the agent is sitting at its prompt waiting for input.
             // This should not affect status — otherwise it would override Success after a Stop event.
@@ -270,6 +267,7 @@ impl CLIAgentSessionsModelEvent {
 }
 
 /// Singleton model that tracks pane-scoped CLI agent state and plugin-enriched session context.
+#[derive(Default)]
 pub struct CLIAgentSessionsModel {
     sessions: HashMap<EntityId, CLIAgentSession>,
     /// Tracks (agent, remote_host) pairs where an auto plugin operation (install or update) has failed.
