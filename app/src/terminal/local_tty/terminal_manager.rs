@@ -116,6 +116,10 @@ use super::shell::ShellStarter;
 use super::{event_loop::EventLoop, shell::ShellStarterSource};
 
 use crate::server::server_api::ServerApiProvider;
+#[cfg(windows)]
+const CLI_AGENT_SEND_BINARY_NAME: &str = "warp-cli-agent-send.exe";
+#[cfg(not(windows))]
+const CLI_AGENT_SEND_BINARY_NAME: &str = "warp-cli-agent-send";
 #[cfg(unix)]
 use {
     super::terminal_attributes::TerminalAttributesPoller,
@@ -129,6 +133,15 @@ type RemoteServerController =
     writeable_pty::remote_server_controller::RemoteServerController<mio_channel::Sender<Message>>;
 
 const ACL_UPDATE_FAILURE_RESPONSE: &str = "Something went wrong. Please try again.";
+
+#[cfg(not(target_family = "wasm"))]
+fn cli_agent_send_path() -> Option<OsString> {
+    let resources_dir = warp_core::paths::bundled_resources_dir()?;
+    let helper_path = resources_dir
+        .join("bin")
+        .join(CLI_AGENT_SEND_BINARY_NAME);
+    helper_path.is_file().then(|| helper_path.into_os_string())
+}
 
 /// The TerminalManager is responsible for
 /// - creating the terminal model
@@ -275,6 +288,9 @@ impl TerminalManager {
                                 .to_string(),
                         ),
                     );
+                    if let Some(helper_path) = cli_agent_send_path() {
+                        env_vars.insert(OsString::from("WARP_CLI_AGENT_SEND"), helper_path);
+                    }
                     Some(listener)
                 }
                 Err(err) => {

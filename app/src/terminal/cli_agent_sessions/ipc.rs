@@ -40,9 +40,17 @@ impl CLIAgentIpcListener {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = shutdown.clone();
         let thread_token = token.clone();
+        let thread_executor = background_executor.clone();
         background_executor
             .spawn(async move {
-                run_listener(listener, event_sender, thread_token, thread_shutdown).await;
+                run_listener(
+                    listener,
+                    event_sender,
+                    thread_token,
+                    thread_shutdown,
+                    thread_executor,
+                )
+                .await;
             })
             .detach();
 
@@ -74,49 +82,75 @@ async fn run_listener(
     event_sender: Sender<Event>,
     expected_token: String,
     shutdown: Arc<AtomicBool>,
+    background_executor: Arc<Background>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept().await {
-            Ok((mut stream, _)) => {
+            Ok((stream, _)) => {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                let mut bytes = Vec::new();
-                let mut read_stream = (&mut stream).take(MAX_IPC_MESSAGE_BYTES);
-                let read_future = read_stream.read_to_end(&mut bytes).fuse();
-                let timeout_future = async_io::Timer::after(MAX_IPC_READ_TIMEOUT).fuse();
-                pin_mut!(read_future, timeout_future);
-
-                let read_result = select! {
-                    result = read_future => result,
-                    _ = timeout_future => {
-                        log::warn!(
-                            "Timed out reading CLI agent IPC event after {:?}",
-                            MAX_IPC_READ_TIMEOUT
-                        );
-                        continue;
-                    }
-                };
-
-                match read_result {
-                    Ok(_) => {
-                        if let Some((title, body)) = parse_ipc_message(&bytes, &expected_token) {
-                            if let Err(err) =
-                                event_sender.try_send(Event::PluggableNotification { title, body })
-                            {
-                                log::warn!("Failed to forward CLI agent IPC event: {err}");
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        log::warn!("Failed to read CLI agent IPC event: {err}");
-                    }
-                }
+                let connection_sender = event_sender.clone();
+                let connection_token = expected_token.clone();
+                let connection_shutdown = shutdown.clone();
+                background_executor
+                    .spawn(async move {
+                        handle_connection(
+                            stream,
+                            connection_sender,
+                            connection_token,
+                            connection_shutdown,
+                        )
+                        .await;
+                    })
+                    .detach();
             }
             Err(err) => {
                 log::warn!("CLI agent IPC listener failed to accept connection: {err}");
                 break;
             }
+        }
+    }
+}
+
+async fn handle_connection(
+    mut stream: async_io::Async<TcpStream>,
+    event_sender: Sender<Event>,
+    expected_token: String,
+    shutdown: Arc<AtomicBool>,
+) {
+    if shutdown.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let mut bytes = Vec::new();
+    let mut read_stream = (&mut stream).take(MAX_IPC_MESSAGE_BYTES);
+    let read_future = read_stream.read_to_end(&mut bytes).fuse();
+    let timeout_future = async_io::Timer::after(MAX_IPC_READ_TIMEOUT).fuse();
+    pin_mut!(read_future, timeout_future);
+
+    let read_result = select! {
+        result = read_future => result,
+        _ = timeout_future => {
+            log::warn!(
+                "Timed out reading CLI agent IPC event after {:?}",
+                MAX_IPC_READ_TIMEOUT
+            );
+            return;
+        }
+    };
+
+    match read_result {
+        Ok(_) => {
+            if let Some((title, body)) = parse_ipc_message(&bytes, &expected_token) {
+                if let Err(err) = event_sender.try_send(Event::PluggableNotification { title, body })
+                {
+                    log::warn!("Failed to forward CLI agent IPC event: {err}");
+                }
+            }
+        }
+        Err(err) => {
+            log::warn!("Failed to read CLI agent IPC event: {err}");
         }
     }
 }

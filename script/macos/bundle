@@ -353,6 +353,8 @@ elif [[ "$ARTIFACT" == app ]]; then
   FEATURES="$FEATURES,gui,nld_improvements"
 fi
 
+CLI_AGENT_HELPER_BIN="warp-cli-agent-send"
+
 # If we're building a universal bundle for the app artifact, make sure the additional target is available.
 if [[ $UNIVERSAL_BINARY = true ]]; then
     rustup target add "$ADDITIONAL_TARGET"
@@ -362,9 +364,9 @@ fi
 # then exit.  We use this script to invoke `cargo check` to ensure that we are
 # using the same feature flags and profile that we would be using in production.
 if [[ "$CHECK_ONLY" == "true" ]]; then
-  cargo check --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --target "$DEFAULT_TARGET" --features "$FEATURES"
+  cargo check --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --bin "$CLI_AGENT_HELPER_BIN" --target "$DEFAULT_TARGET" --features "$FEATURES"
   if [[ $UNIVERSAL_BINARY = true && "$ARTIFACT" != "cli" ]]; then
-    cargo check --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --target "$ADDITIONAL_TARGET" --features "$FEATURES"
+    cargo check --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --bin "$CLI_AGENT_HELPER_BIN" --target "$ADDITIONAL_TARGET" --features "$FEATURES"
   fi
   exit 0
 fi
@@ -390,6 +392,11 @@ if [[ "$ARTIFACT" == "app" ]]; then
   if [[ $BUILD_BINARY != true ]]; then
     echo "Skipping binary build due to --skip-build flag"
     export CARGO_BUNDLE_SKIP_BUILD=1
+  else
+    pushd app > /dev/null
+    echo "Building CLI agent helper for $DEFAULT_TARGET with profile $CARGO_PROFILE"
+    cargo build --profile "$CARGO_PROFILE" --bin "$CLI_AGENT_HELPER_BIN" --target "$DEFAULT_TARGET" --features "$FEATURES"
+    popd > /dev/null
   fi
 
   pushd app > /dev/null
@@ -463,7 +470,7 @@ if [[ "$ARTIFACT" == "app" ]]; then
           echo "Building $ADDITIONAL_TARGET to include in universal binary"
 
           pushd app > /dev/null
-          cargo build --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --target "$ADDITIONAL_TARGET" --features "$FEATURES"
+          cargo build --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --bin "$CLI_AGENT_HELPER_BIN" --target "$ADDITIONAL_TARGET" --features "$FEATURES"
           popd > /dev/null
       else
           echo "Skipping build of $ADDITIONAL_TARGET due to --skip-build flag"
@@ -479,6 +486,11 @@ if [[ "$ARTIFACT" == "app" ]]; then
       lipo -create -output "$tmp_bundle_dir/$WARP_BIN" \
           "target/$INTEL_TARGET/$TARGET_PROFILE_DIR/$WARP_BIN" \
           "target/$ARM_TARGET/$TARGET_PROFILE_DIR/$WARP_BIN"
+
+      echo "Building universal CLI agent helper using lipo."
+      lipo -create -output "$tmp_bundle_dir/$CLI_AGENT_HELPER_BIN" \
+          "target/$INTEL_TARGET/$TARGET_PROFILE_DIR/$CLI_AGENT_HELPER_BIN" \
+          "target/$ARM_TARGET/$TARGET_PROFILE_DIR/$CLI_AGENT_HELPER_BIN"
 
       # Compute the real absolute path to the dSYM file, factoring in symlinks.
       # Starting in Rust 1.56, the generated dSYMs are symlinks to files within the target/dep directory. For example,
@@ -517,6 +529,15 @@ if [[ "$ARTIFACT" == "app" ]]; then
   BUNDLED_RESOURCES_DIR="$BUNDLE_DIR/$WARP_APP_NAME.app/Contents/Resources"
   echo "Preparing bundled resources..."
   "$WORKSPACE_ROOT_DIR/script/prepare_bundled_resources" "$BUNDLED_RESOURCES_DIR" "$RELEASE_CHANNEL" "$CARGO_PROFILE"
+
+  echo "Installing CLI agent helper into bundled resources..."
+  mkdir -p "$BUNDLED_RESOURCES_DIR/bin"
+  if [[ $UNIVERSAL_BINARY = true ]]; then
+      mv "$tmp_bundle_dir/$CLI_AGENT_HELPER_BIN" "$BUNDLED_RESOURCES_DIR/bin/$CLI_AGENT_HELPER_BIN"
+  else
+      cp "target/$DEFAULT_TARGET/$TARGET_PROFILE_DIR/$CLI_AGENT_HELPER_BIN" "$BUNDLED_RESOURCES_DIR/bin/$CLI_AGENT_HELPER_BIN"
+  fi
+  chmod +x "$BUNDLED_RESOURCES_DIR/bin/$CLI_AGENT_HELPER_BIN"
 
   "$WORKSPACE_ROOT_DIR/script/compile_icon" "$RELEASE_CHANNEL" "$BUNDLE_DIR/$WARP_APP_NAME.app"
 
@@ -572,7 +593,7 @@ elif [[ "$ARTIFACT" == "cli" ]]; then
     export "INFO_PLIST_PATH=$(realpath "$WARP_PLIST_PATH")"
     pushd app > /dev/null
     echo "Building $DEFAULT_TARGET for channel $RELEASE_CHANNEL with profile $CARGO_PROFILE"
-    cargo build --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --target "$DEFAULT_TARGET" --features "$FEATURES"
+    cargo build --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --bin "$CLI_AGENT_HELPER_BIN" --target "$DEFAULT_TARGET" --features "$FEATURES"
     popd > /dev/null
   else
     echo "Skipping binary build due to --skip-build flag"
@@ -589,6 +610,11 @@ elif [[ "$ARTIFACT" == "cli" ]]; then
   echo "Preparing CLI resources directory"
   BUNDLED_RESOURCES_DIR="$OUT_DIR/resources"
   "$WORKSPACE_ROOT_DIR/script/prepare_bundled_resources" "$BUNDLED_RESOURCES_DIR" "$RELEASE_CHANNEL" "$CARGO_PROFILE"
+
+  echo "Installing CLI agent helper into CLI resources"
+  mkdir -p "$BUNDLED_RESOURCES_DIR/bin"
+  cp "target/$DEFAULT_TARGET/$TARGET_PROFILE_DIR/$CLI_AGENT_HELPER_BIN" "$BUNDLED_RESOURCES_DIR/bin/$CLI_AGENT_HELPER_BIN"
+  chmod +x "$BUNDLED_RESOURCES_DIR/bin/$CLI_AGENT_HELPER_BIN"
 
 
   # Set the primary binary path to output.

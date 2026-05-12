@@ -201,6 +201,9 @@ fi
 BUNDLE_ID="dev.warp.$APP_NAME"
 EXECUTABLE_PATH="$CARGO_TARGET_OUTPUT_DIR/$WARP_BIN"
 DEBUG_EXECUTABLE_PATH="$EXECUTABLE_PATH.debug"
+CLI_AGENT_HELPER_BIN="warp-cli-agent-send"
+HELPER_EXECUTABLE_PATH="$CARGO_TARGET_OUTPUT_DIR/$CLI_AGENT_HELPER_BIN"
+HELPER_BINARY_NAME="$CLI_AGENT_HELPER_BIN"
 
 # Note that this variable must be set (and exported!) before we compile the
 # binary, as it is read at compile time by Linux autoupdate logic (to know the
@@ -211,14 +214,14 @@ export APPIMAGE_NAME="$APP_NAME-$BUILD_ARCH.AppImage"
 # then exit.  We use this script to invoke `cargo check` to ensure that we are
 # using the same feature flags and profile that we would be using in production.
 if [[ "$CHECK_ONLY" == "true" ]]; then
-  cargo check -p warp --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --features "$FEATURES"
+  cargo check -p warp --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --bin "$CLI_AGENT_HELPER_BIN" --features "$FEATURES"
   exit 0
 fi
 
 # Build the binary.
 if [[ "$BUILD" == "true" ]]; then
   echo "Building and bundling Warp for channel $RELEASE_CHANNEL and bundle id $BUNDLE_ID"
-  cargo build -p warp --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --features "$FEATURES"
+  cargo build -p warp --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --bin "$CLI_AGENT_HELPER_BIN" --features "$FEATURES"
   echo "Making debug copy of '$EXECUTABLE_PATH' at '$DEBUG_EXECUTABLE_PATH'"
   cp "$EXECUTABLE_PATH" "$DEBUG_EXECUTABLE_PATH"
 
@@ -241,6 +244,9 @@ if [[ "$ARTIFACT" == "cli" ]]; then
   echo "Preparing CLI resources directory"
   BUNDLED_RESOURCES_DIR="$OUT_DIR/resources"
   "$WORKSPACE_ROOT_DIR/script/prepare_bundled_resources" "$BUNDLED_RESOURCES_DIR" "$RELEASE_CHANNEL" "$CARGO_PROFILE"
+  mkdir -p "$BUNDLED_RESOURCES_DIR/bin"
+  cp "$HELPER_EXECUTABLE_PATH" "$BUNDLED_RESOURCES_DIR/bin/$HELPER_BINARY_NAME"
+  chmod +x "$BUNDLED_RESOURCES_DIR/bin/$HELPER_BINARY_NAME"
 fi
 
 
@@ -266,6 +272,8 @@ export \
   BUNDLE_ID \
   EXECUTABLE_PATH \
   BINARY_NAME \
+  HELPER_EXECUTABLE_PATH \
+  HELPER_BINARY_NAME \
   APPIMAGE_NAME \
   BUILD_ARCH \
   ARTIFACT \
