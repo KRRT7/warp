@@ -1,5 +1,5 @@
 pub mod event;
-#[cfg(unix)]
+#[cfg(not(target_family = "wasm"))]
 pub mod ipc;
 pub mod listener;
 #[cfg(not(target_family = "wasm"))]
@@ -14,6 +14,9 @@ use crate::ai::blocklist::InputConfig;
 use self::listener::CLIAgentSessionListener;
 use super::CLIAgent;
 use event::{CLIAgentEvent, CLIAgentEventType};
+
+/// Protocol version used by the Warp CLI agent IPC helper.
+pub const CLI_AGENT_IPC_PROTOCOL_VERSION: u32 = 1;
 
 /// Status of a tracked CLI agent session.
 #[derive(Debug, Clone, PartialEq, Eq)]

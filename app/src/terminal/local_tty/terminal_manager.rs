@@ -37,7 +37,7 @@ use crate::view_components::ToastFlavor;
 use parking_lot::{FairMutex, Mutex};
 use pathfinder_geometry::vector::Vector2F;
 
-#[cfg(unix)]
+#[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::ipc::CLIAgentIpcListener;
 use crate::terminal::cli_agent_sessions::{
     CLIAgentInputState, CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
@@ -161,9 +161,9 @@ pub struct TerminalManager {
     #[expect(dead_code)]
     remote_server_controller: ModelHandle<RemoteServerController>,
 
-    /// The manager owns the per-terminal CLI agent IPC socket advertised to
+    /// The manager owns the per-terminal CLI agent IPC endpoint advertised to
     /// shell children via `WARP_CLI_AGENT_IPC`.
-    #[cfg(unix)]
+    #[cfg(not(target_family = "wasm"))]
     #[allow(dead_code)]
     cli_agent_ipc_listener: Option<CLIAgentIpcListener>,
 
@@ -253,13 +253,27 @@ impl TerminalManager {
         let channel_event_proxy =
             ChannelEventListener::new(wakeups_tx, events_tx.clone(), pty_reads_tx);
 
-        #[cfg(unix)]
+        #[cfg(not(target_family = "wasm"))]
         let cli_agent_ipc_listener = if FeatureFlag::HOANotifications.is_enabled() {
-            match CLIAgentIpcListener::start(events_tx.clone()) {
+            match CLIAgentIpcListener::start(
+                events_tx.clone(),
+                ctx.background_executor().clone(),
+            ) {
                 Ok(listener) => {
                     env_vars.insert(
                         OsString::from("WARP_CLI_AGENT_IPC"),
-                        listener.socket_path().as_os_str().to_owned(),
+                        listener.endpoint().to_owned().into(),
+                    );
+                    env_vars.insert(
+                        OsString::from("WARP_CLI_AGENT_TOKEN"),
+                        listener.token().to_owned().into(),
+                    );
+                    env_vars.insert(
+                        OsString::from("WARP_CLI_AGENT_PROTOCOL_VERSION"),
+                        OsString::from(
+                            crate::terminal::cli_agent_sessions::CLI_AGENT_IPC_PROTOCOL_VERSION
+                                .to_string(),
+                        ),
                     );
                     Some(listener)
                 }
@@ -271,6 +285,8 @@ impl TerminalManager {
         } else {
             None
         };
+        #[cfg(target_family = "wasm")]
+        let cli_agent_ipc_listener = None;
 
         // Initialize the sessions model.
         let sessions = ctx.add_model(|ctx| Sessions::new(executor_command_tx.clone(), ctx));
@@ -766,11 +782,11 @@ impl TerminalManager {
             model,
             event_loop_handle: None,
             view,
-            #[cfg(unix)]
+            #[cfg(not(target_family = "wasm"))]
             terminal_attributes_poller: None,
             pty_controller,
             remote_server_controller,
-            #[cfg(unix)]
+            #[cfg(not(target_family = "wasm"))]
             cli_agent_ipc_listener,
 
             #[cfg(feature = "integration_tests")]

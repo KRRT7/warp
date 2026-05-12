@@ -53,6 +53,11 @@ name = "generate_settings_schema"
 path = "src/bin/generate_settings_schema.rs"
 test = false
 
+[[bin]]
+name = "warp-cli-agent-send"
+path = "src/bin/cli_agent_send.rs"
+test = false
+
 [dependencies]
 addr = "0.15.6"
 ai.workspace = true
