@@ -365,6 +365,67 @@ impl Default for Processor {
     }
 }
 
+/// Returns the length of the longest prefix of `bytes` that is ASCII printable (0x20..=0x7E).
+/// Uses SIMD (SSE2) on x86_64 for 16-byte-at-a-time scanning.
+#[inline]
+fn ascii_printable_prefix_len(bytes: &[u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        unsafe {
+            let len = bytes.len();
+            let ptr = bytes.as_ptr();
+            let mut i = 0;
+
+            // Trick: subtract 0x20 from each byte (wrapping), then check if result > 0x5E.
+            // Bytes in [0x20, 0x7E] map to [0x00, 0x5E] — all <= 0x5E.
+            // Bytes < 0x20 underflow to [0xE0, 0xFF] — all > 0x5E.
+            // Bytes > 0x7E map to [0x5F, 0xBF] — all > 0x5E (except 0x7F maps to 0x5F).
+            // For signed cmpgt: bias to signed range.
+            let bias = _mm_set1_epi8(-0x20i8);
+            // 0x5E as signed i8 = 94 which fits in i8
+            let threshold = _mm_set1_epi8(0x5Ei8);
+
+            while i + 16 <= len {
+                let chunk = _mm_loadu_si128(ptr.add(i) as *const __m128i);
+                // Subtract 0x20 (add -0x20)
+                let biased = _mm_add_epi8(chunk, bias);
+                // Compare: biased > 0x5E (signed). This catches bytes outside [0x20, 0x7E].
+                // But we need unsigned comparison. Use the standard trick:
+                // flip sign bits on both operands to convert signed cmpgt to unsigned cmpgt.
+                let sign_flip = _mm_set1_epi8(i8::MIN);
+                let non_printable = _mm_cmpgt_epi8(
+                    _mm_xor_si128(biased, sign_flip),
+                    _mm_xor_si128(threshold, sign_flip),
+                );
+                let mask = _mm_movemask_epi8(non_printable);
+                if mask != 0 {
+                    return i + mask.trailing_zeros() as usize;
+                }
+                i += 16;
+            }
+
+            // Scalar tail
+            while i < len {
+                let b = *ptr.add(i);
+                if b < 0x20 || b > 0x7E {
+                    return i;
+                }
+                i += 1;
+            }
+            len
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        bytes
+            .iter()
+            .position(|&b| b < 0x20 || b > 0x7E)
+            .unwrap_or(bytes.len())
+    }
+}
+
 impl Processor {
     pub fn new() -> Processor {
         Default::default()
@@ -397,14 +458,10 @@ impl Processor {
     {
         let mut bytes = input.bytes;
 
-        // Bytes are parsed fundamentally differently if they're coming from a connection to tmux
-        // control mode vs a standard pty. Though quite uncommon, tmux control mode can potentially
-        // be entered and exited multiple times in a batch of bytes. This loop is so we can
-        // continue to process bytes until we've processed through all tmux control mode state
-        // changes.
         while !bytes.is_empty() {
-            match &mut self.state.tmux_control_mode {
-                None => {
+            if self.state.tmux_control_mode.is_none() {
+                // When sync output is active, use the buffering path
+                if self.state.sync_output.is_active() {
                     let mut remaining_bytes_index = bytes.len();
                     for (idx, byte) in bytes.iter().enumerate() {
                         let was_sync_output = self.state.sync_output.is_active();
@@ -414,11 +471,6 @@ impl Processor {
                         if self.state.tmux_control_mode.is_some()
                             || was_sync_output != is_sync_output
                         {
-                            // We split up the batch processing in two cases:
-                            // 1. Tmux control mode started. Remaining bytes must be processed in a
-                            //    control mode context.
-                            // 2. Synchronized output was toggled. The pre- and post-toggle bytes should be
-                            //    handled in separate `on_finish_byte_processing` calls.
                             remaining_bytes_index = idx + 1;
                             break;
                         }
@@ -429,60 +481,296 @@ impl Processor {
                     });
 
                     if self.state.tmux_control_mode.is_some() {
-                        // Tmux control mode has just started -- notify the handler.
                         handler.tmux_control_mode_event(ControlModeEvent::Starting);
                     }
 
                     bytes = &bytes[remaining_bytes_index..];
+                    continue;
                 }
 
-                Some(tmux_control_mode) => {
-                    let mut tmux_performer = TmuxPerformer::new(
-                        &mut tmux_control_mode.control_mode_state,
-                        handler,
-                        writer,
-                    );
-                    let mut remaining_bytes_index = bytes.len();
-                    for (idx, byte) in bytes.iter().enumerate() {
-                        tmux_control_mode
-                            .control_mode_parser
-                            .advance(&mut tmux_performer, *byte);
+                let state = &mut self.state;
+                let parser = &mut self.parser;
+                let mut remaining_bytes_index = bytes.len();
 
-                        if tmux_performer.exited {
-                            remaining_bytes_index = idx + 1;
-                            break;
+                let mut performer = Performer::new(state, handler, writer);
+                let mut idx = 0;
+                let mut in_ground = parser.is_ground_state();
+                while idx < bytes.len() {
+                    if in_ground {
+                        let b = bytes[idx];
+                        match b {
+                        0x20..=0x7E => {
+                            let remaining = &bytes[idx..];
+                            let ascii_len = ascii_printable_prefix_len(remaining);
+                            let ascii_run = &bytes[idx..idx + ascii_len];
+                            for &ab in ascii_run {
+                                performer.handler.input(ab as char);
+                            }
+                            performer.state.preceding_char =
+                                Some(ascii_run[ascii_run.len() - 1] as char);
+                            idx += ascii_len;
+                            continue;
+                        }
+                        0x1b => {
+                            // Escape: try CSI fast-scan, then ESC dispatch
+                            if idx + 1 < bytes.len() {
+                                let next = bytes[idx + 1];
+                                if next == b'[' {
+                                    // Ultra-fast: single-param SGR \x1b[<1-3 digits>m
+                                    let remain = bytes.len() - idx;
+                                    if remain >= 4 {
+                                        let p0 = bytes[idx + 2];
+                                        if p0.is_ascii_digit() {
+                                            let p1 = bytes[idx + 3];
+                                            if p1 == b'm' {
+                                                let mut params = vte::Params::default();
+                                                params.push((p0 - b'0') as u16);
+                                                performer.csi_dispatch(&params, &[], false, 'm');
+                                                idx += 4;
+                                                continue;
+                                            }
+                                            if remain >= 5 && p1.is_ascii_digit() {
+                                                let p2 = bytes[idx + 4];
+                                                if p2 == b'm' {
+                                                    let mut params = vte::Params::default();
+                                                    params.push((p0 - b'0') as u16 * 10 + (p1 - b'0') as u16);
+                                                    performer.csi_dispatch(&params, &[], false, 'm');
+                                                    idx += 5;
+                                                    continue;
+                                                }
+                                                if remain >= 6 && p2.is_ascii_digit() && bytes[idx + 5] == b'm' {
+                                                    let mut params = vte::Params::default();
+                                                    params.push((p0 - b'0') as u16 * 100 + (p1 - b'0') as u16 * 10 + (p2 - b'0') as u16);
+                                                    performer.csi_dispatch(&params, &[], false, 'm');
+                                                    idx += 6;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Ultra-fast: \x1b[<d>;<d><final> (2 single-digit params)
+                                    if remain >= 6 {
+                                        let p0 = bytes[idx + 2];
+                                        if p0.is_ascii_digit() && bytes[idx + 3] == b';' {
+                                            let p1 = bytes[idx + 4];
+                                            let fb = bytes[idx + 5];
+                                            if p1.is_ascii_digit() && fb >= 0x40 && fb <= 0x7E {
+                                                let mut params = vte::Params::default();
+                                                params.push((p0 - b'0') as u16);
+                                                params.push((p1 - b'0') as u16);
+                                                performer.csi_dispatch(&params, &[], false, fb as char);
+                                                idx += 6;
+                                                continue;
+                                            }
+                                            // \x1b[<d>;<dd><final> (1+2 digit params)
+                                            if remain >= 7 && p1.is_ascii_digit() {
+                                                let p1b = bytes[idx + 5];
+                                                let fb2 = bytes[idx + 6];
+                                                if p1b.is_ascii_digit() && fb2 >= 0x40 && fb2 <= 0x7E {
+                                                    let mut params = vte::Params::default();
+                                                    params.push((p0 - b'0') as u16);
+                                                    params.push((p1 - b'0') as u16 * 10 + (p1b - b'0') as u16);
+                                                    performer.csi_dispatch(&params, &[], false, fb2 as char);
+                                                    idx += 7;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let csi_start = idx + 2;
+                                    let csi_bytes = &bytes[csi_start..];
+                                    let scan_result = csi_bytes.iter().position(|&cb| cb >= 0x40 || cb < 0x20);
+                                    let (csi_end, valid) = match scan_result {
+                                        Some(pos) if csi_bytes[pos] >= 0x40 && csi_bytes[pos] <= 0x7E => {
+                                            (csi_start + pos, true)
+                                        }
+                                        _ => (csi_start, false),
+                                    };
+                                    if valid && csi_end < bytes.len() {
+                                        let final_byte = bytes[csi_end];
+                                        let params_slice = &bytes[csi_start..csi_end];
+                                        // Fast path: pure-numeric params (digits and semicolons only)
+                                        let all_simple = params_slice.iter().all(|&b| b.is_ascii_digit() || b == b';');
+                                        if all_simple {
+                                            let mut params = vte::Params::default();
+                                            let mut current_num: u16 = 0;
+                                            let mut has_digit = false;
+                                            for &pb in params_slice {
+                                                if pb.is_ascii_digit() {
+                                                    current_num = current_num
+                                                        .wrapping_mul(10)
+                                                        .wrapping_add((pb - b'0') as u16);
+                                                    has_digit = true;
+                                                } else {
+                                                    // semicolon
+                                                    params.push(if has_digit { current_num } else { 0 });
+                                                    current_num = 0;
+                                                    has_digit = false;
+                                                }
+                                            }
+                                            if has_digit || !params.is_empty() {
+                                                params.push(if has_digit { current_num } else { 0 });
+                                            }
+                                            performer.csi_dispatch(
+                                                &params,
+                                                &[],
+                                                false,
+                                                final_byte as char,
+                                            );
+                                        } else {
+                                            // General path: handles intermediates, colons, private modes
+                                            let mut params = vte::Params::default();
+                                            let mut intermediates: [u8; 2] = [0; 2];
+                                            let mut intermediates_len = 0usize;
+                                            let mut current_num: u16 = 0;
+                                            let mut has_digit = false;
+                                            for &pb in params_slice {
+                                                match pb {
+                                                    b'0'..=b'9' => {
+                                                        current_num = current_num
+                                                            .saturating_mul(10)
+                                                            .saturating_add((pb - b'0') as u16);
+                                                        has_digit = true;
+                                                    }
+                                                    b';' => {
+                                                        params.push(if has_digit { current_num } else { 0 });
+                                                        current_num = 0;
+                                                        has_digit = false;
+                                                    }
+                                                    b':' => {
+                                                        if has_digit {
+                                                            params.push(current_num);
+                                                        } else {
+                                                            params.push(0);
+                                                        }
+                                                        current_num = 0;
+                                                        has_digit = false;
+                                                    }
+                                                    b'<'..=b'?' => {
+                                                        if intermediates_len < 2 {
+                                                            intermediates[intermediates_len] = pb;
+                                                            intermediates_len += 1;
+                                                        }
+                                                    }
+                                                    b' '..=b'/' => {
+                                                        if intermediates_len < 2 {
+                                                            intermediates[intermediates_len] = pb;
+                                                            intermediates_len += 1;
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            if has_digit || !params.is_empty() {
+                                                params.push(if has_digit { current_num } else { 0 });
+                                            }
+                                            performer.csi_dispatch(
+                                                &params,
+                                                &intermediates[..intermediates_len],
+                                                false,
+                                                final_byte as char,
+                                            );
+                                        }
+                                        idx = csi_end + 1;
+                                        continue;
+                                    }
+                                } else if (0x40..=0x5F).contains(&next) && next != b']'
+                                    && next != b'P' && next != b'X' && next != b'^' && next != b'_'
+                                {
+                                    performer.esc_dispatch(&[], false, next);
+                                    idx += 2;
+                                    continue;
+                                }
+                            }
+                            // Fall through to VTE for incomplete/complex escapes
+                        }
+                        0x0A | 0x0B | 0x0C => {
+                            performer.handler.linefeed();
+                            idx += 1;
+                            continue;
+                        }
+                        0x0D => {
+                            performer.handler.carriage_return();
+                            idx += 1;
+                            continue;
+                        }
+                        0x08 => {
+                            performer.handler.backspace();
+                            idx += 1;
+                            continue;
+                        }
+                        0x09 => {
+                            performer.handler.put_tab(1);
+                            idx += 1;
+                            continue;
+                        }
+                        _ => {}
                         }
                     }
 
-                    let control_mode_exited = tmux_performer.exited;
-                    let parse_error = tmux_performer.parse_error;
-                    let primary_pane_output = tmux_performer.finish();
-                    handler.on_finish_byte_processing(&ProcessorInput {
-                        bytes: &primary_pane_output,
-                        ..input
-                    });
+                    in_ground = false;
+                    let was_sync_output = performer.state.sync_output.is_active();
+                    parser.advance(&mut performer, bytes[idx]);
+                    let is_sync_output = performer.state.sync_output.is_active();
+                    in_ground = parser.is_ground_state();
 
-                    if control_mode_exited {
-                        self.state.tmux_control_mode = None;
-
-                        // Tmux control mode has just exited -- notify the handler.
-                        handler.tmux_control_mode_event(ControlModeEvent::Exited);
-
-                        if parse_error {
-                            // A parse error means that means control mode has exited unexpectedly and we
-                            // shouldn't expect to get the OSC end marker, so we reset our state back to
-                            // default manually.
-                            *self = Default::default();
-
-                            // A parse error also indicates that the last byte read (that caused the parse
-                            // error) actually isn't from tmux control mode, so we should process it along
-                            // with the rest of the remaining input.
-                            remaining_bytes_index -= 1;
-                        }
+                    if performer.state.tmux_control_mode.is_some()
+                        || was_sync_output != is_sync_output
+                    {
+                        remaining_bytes_index = idx + 1;
+                        break;
                     }
-
-                    bytes = &bytes[remaining_bytes_index..];
+                    idx += 1;
                 }
+
+                handler.on_finish_byte_processing(&ProcessorInput {
+                    bytes: &bytes[..remaining_bytes_index],
+                    ..input
+                });
+
+                if self.state.tmux_control_mode.is_some() {
+                    handler.tmux_control_mode_event(ControlModeEvent::Starting);
+                }
+
+                bytes = &bytes[remaining_bytes_index..];
+            } else {
+                let tmux_control_mode = self.state.tmux_control_mode.as_mut().unwrap();
+                let mut tmux_performer = TmuxPerformer::new(
+                    &mut tmux_control_mode.control_mode_state,
+                    handler,
+                    writer,
+                );
+                let mut remaining_bytes_index = bytes.len();
+                for (idx, byte) in bytes.iter().enumerate() {
+                    tmux_control_mode
+                        .control_mode_parser
+                        .advance(&mut tmux_performer, *byte);
+
+                    if tmux_performer.exited {
+                        remaining_bytes_index = idx + 1;
+                        break;
+                    }
+                }
+
+                let control_mode_exited = tmux_performer.exited;
+                let parse_error = tmux_performer.parse_error;
+                let primary_pane_output = tmux_performer.finish();
+                handler.on_finish_byte_processing(&ProcessorInput {
+                    bytes: &primary_pane_output,
+                    ..input
+                });
+
+                if control_mode_exited {
+                    self.state.tmux_control_mode = None;
+                    handler.tmux_control_mode_event(ControlModeEvent::Exited);
+
+                    if parse_error {
+                        *self = Default::default();
+                        remaining_bytes_index -= 1;
+                    }
+                }
+
+                bytes = &bytes[remaining_bytes_index..];
             }
         }
     }

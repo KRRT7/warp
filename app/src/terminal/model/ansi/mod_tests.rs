@@ -886,3 +886,561 @@ fn tmux_pane_writer_returns_original_byte_count() {
     assert!(output_str.starts_with("send-keys -Ht %42"));
     assert!(output_str.ends_with('\n'));
 }
+
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::io;
+    use std::time::Instant;
+    use std::hint::black_box;
+
+    #[test]
+    fn bench_parse_bytes_pure_ascii_1mb() {
+        let data: Vec<u8> = (0..1_048_576).map(|i| b'A' + (i % 26) as u8).collect();
+        let mut processor = Processor::default();
+        let mut handler = MockHandler::default();
+        let mut writer = io::sink();
+
+        // Warmup
+        for _ in 0..3 {
+            processor.parse_bytes(&mut handler, &data, &mut writer);
+        }
+
+        let iters = 20;
+        let start = Instant::now();
+        for _ in 0..iters {
+            processor.parse_bytes(black_box(&mut handler), black_box(&data), &mut writer);
+        }
+        let elapsed = start.elapsed();
+        let per_iter = elapsed / iters;
+        let throughput = (data.len() as f64 * iters as f64) / elapsed.as_secs_f64() / 1e9;
+        eprintln!(
+            "bench_parse_bytes_pure_ascii_1mb: {:?}/iter ({:.2} GB/s)",
+            per_iter, throughput
+        );
+    }
+
+    #[test]
+    fn bench_parse_bytes_mixed_1mb() {
+        // Mix of ASCII text with occasional escape sequences
+        let mut data = Vec::with_capacity(1_048_576);
+        let mut i = 0;
+        while data.len() < 1_048_576 {
+            if i % 100 == 0 {
+                // SGR color escape every 100 chars
+                data.extend_from_slice(b"\x1b[38;2;255;128;0m");
+            } else {
+                data.push(b'A' + (i % 26) as u8);
+            }
+            i += 1;
+        }
+        let mut processor = Processor::default();
+        let mut handler = MockHandler::default();
+        let mut writer = io::sink();
+
+        for _ in 0..3 {
+            processor.parse_bytes(&mut handler, &data, &mut writer);
+        }
+
+        let iters = 20;
+        let start = Instant::now();
+        for _ in 0..iters {
+            processor.parse_bytes(black_box(&mut handler), black_box(&data), &mut writer);
+        }
+        let elapsed = start.elapsed();
+        let per_iter = elapsed / iters;
+        let throughput = (data.len() as f64 * iters as f64) / elapsed.as_secs_f64() / 1e9;
+        eprintln!(
+            "bench_parse_bytes_mixed_1mb: {:?}/iter ({:.2} GB/s)",
+            per_iter, throughput
+        );
+    }
+
+    #[test]
+    fn bench_parse_bytes_escape_heavy() {
+        // Mostly escape sequences (simulating heavy TUI output)
+        let mut data = Vec::with_capacity(1_048_576);
+        while data.len() < 1_048_576 {
+            // cursor move + SGR + char
+            data.extend_from_slice(b"\x1b[1;1H\x1b[31mX");
+        }
+        let mut processor = Processor::default();
+        let mut handler = MockHandler::default();
+        let mut writer = io::sink();
+
+        for _ in 0..3 {
+            processor.parse_bytes(&mut handler, &data, &mut writer);
+        }
+
+        let iters = 20;
+        let start = Instant::now();
+        for _ in 0..iters {
+            processor.parse_bytes(black_box(&mut handler), black_box(&data), &mut writer);
+        }
+        let elapsed = start.elapsed();
+        let per_iter = elapsed / iters;
+        let throughput = (data.len() as f64 * iters as f64) / elapsed.as_secs_f64() / 1e9;
+        eprintln!(
+            "bench_parse_bytes_escape_heavy: {:?}/iter ({:.2} GB/s)",
+            per_iter, throughput
+        );
+    }
+
+    #[test]
+    fn bench_baseline_pure_ascii_1mb() {
+        let data: Vec<u8> = (0..1_048_576).map(|i| b'A' + (i % 26) as u8).collect();
+        let mut processor = Processor::default();
+        let mut handler = MockHandler::default();
+        let mut writer = io::sink();
+
+        // Use the old per-byte path by going through parse_byte
+        for _ in 0..3 {
+            for &byte in data.iter() {
+                processor.parse_byte(&mut handler, &mut writer, byte);
+            }
+        }
+
+        let iters = 20;
+        let start = Instant::now();
+        for _ in 0..iters {
+            for &byte in black_box(&data).iter() {
+                processor.parse_byte(black_box(&mut handler), &mut writer, *black_box(&byte));
+            }
+        }
+        let elapsed = start.elapsed();
+        let per_iter = elapsed / iters;
+        let throughput = (data.len() as f64 * iters as f64) / elapsed.as_secs_f64() / 1e9;
+        eprintln!(
+            "BASELINE_pure_ascii_1mb: {:?}/iter ({:.2} GB/s)",
+            per_iter, throughput
+        );
+    }
+
+    #[test]
+    fn bench_ab_escape_heavy() {
+        // A/B/A/B pattern: alternates optimized vs baseline to filter VM noise
+        let seq = b"\x1b[1;1H\x1b[31mX";
+        let data: Vec<u8> = seq.repeat(65536);
+        let iters = 20;
+        let rounds = 4;
+
+        let mut optimized_times = Vec::new();
+        let mut baseline_times = Vec::new();
+
+        for round in 0..rounds {
+            // Optimized (parse_bytes path)
+            {
+                let mut processor = Processor::default();
+                let mut handler = MockHandler::default();
+                let mut writer = io::sink();
+                for _ in 0..3 {
+                    processor.parse_bytes(&mut handler, &data, &mut writer);
+                }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    processor.parse_bytes(black_box(&mut handler), black_box(&data), &mut writer);
+                }
+                optimized_times.push(start.elapsed() / iters);
+            }
+
+            // Baseline (byte-at-a-time VTE path)
+            {
+                let mut processor = Processor::default();
+                let mut handler = MockHandler::default();
+                let mut writer = io::sink();
+                // Warmup
+                for _ in 0..3 {
+                    for &byte in data.iter() {
+                        processor.parse_byte(&mut handler, &mut writer, byte);
+                    }
+                }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    for &byte in black_box(&data).iter() {
+                        processor.parse_byte(black_box(&mut handler), &mut writer, *black_box(&byte));
+                    }
+                }
+                baseline_times.push(start.elapsed() / iters);
+            }
+
+            eprintln!("  Round {}: optimized={:?}, baseline={:?}",
+                round + 1,
+                optimized_times.last().unwrap(),
+                baseline_times.last().unwrap());
+        }
+
+        let opt_avg: std::time::Duration = optimized_times.iter().sum::<std::time::Duration>() / rounds;
+        let base_avg: std::time::Duration = baseline_times.iter().sum::<std::time::Duration>() / rounds;
+        let speedup = base_avg.as_nanos() as f64 / opt_avg.as_nanos() as f64;
+        let throughput_opt = (data.len() as f64) / opt_avg.as_secs_f64() / 1e9;
+        let throughput_base = (data.len() as f64) / base_avg.as_secs_f64() / 1e9;
+        eprintln!("\nA/B ESCAPE-HEAVY ({}B payload):", data.len());
+        eprintln!("  Optimized: {:?}/iter ({:.3} GB/s)", opt_avg, throughput_opt);
+        eprintln!("  Baseline:  {:?}/iter ({:.3} GB/s)", base_avg, throughput_base);
+        eprintln!("  Speedup:   {:.2}x", speedup);
+    }
+
+    #[test]
+    fn bench_ab_pure_ascii() {
+        let data: Vec<u8> = (0..1_048_576).map(|i| b'A' + (i % 26) as u8).collect();
+        let iters = 20;
+        let rounds = 4;
+
+        let mut optimized_times = Vec::new();
+        let mut baseline_times = Vec::new();
+
+        for round in 0..rounds {
+            // Optimized
+            {
+                let mut processor = Processor::default();
+                let mut handler = MockHandler::default();
+                let mut writer = io::sink();
+                for _ in 0..3 {
+                    processor.parse_bytes(&mut handler, &data, &mut writer);
+                }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    processor.parse_bytes(black_box(&mut handler), black_box(&data), &mut writer);
+                }
+                optimized_times.push(start.elapsed() / iters);
+            }
+
+            // Baseline
+            {
+                let mut processor = Processor::default();
+                let mut handler = MockHandler::default();
+                let mut writer = io::sink();
+                for _ in 0..3 {
+                    for &byte in data.iter() {
+                        processor.parse_byte(&mut handler, &mut writer, byte);
+                    }
+                }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    for &byte in black_box(&data).iter() {
+                        processor.parse_byte(black_box(&mut handler), &mut writer, *black_box(&byte));
+                    }
+                }
+                baseline_times.push(start.elapsed() / iters);
+            }
+
+            eprintln!("  Round {}: optimized={:?}, baseline={:?}",
+                round + 1,
+                optimized_times.last().unwrap(),
+                baseline_times.last().unwrap());
+        }
+
+        let opt_avg: std::time::Duration = optimized_times.iter().sum::<std::time::Duration>() / rounds;
+        let base_avg: std::time::Duration = baseline_times.iter().sum::<std::time::Duration>() / rounds;
+        let speedup = base_avg.as_nanos() as f64 / opt_avg.as_nanos() as f64;
+        let throughput_opt = (data.len() as f64) / opt_avg.as_secs_f64() / 1e9;
+        let throughput_base = (data.len() as f64) / base_avg.as_secs_f64() / 1e9;
+        eprintln!("\nA/B PURE-ASCII ({}B payload):", data.len());
+        eprintln!("  Optimized: {:?}/iter ({:.3} GB/s)", opt_avg, throughput_opt);
+        eprintln!("  Baseline:  {:?}/iter ({:.3} GB/s)", base_avg, throughput_base);
+        eprintln!("  Speedup:   {:.2}x", speedup);
+    }
+
+    #[test]
+    fn bench_ab_mixed() {
+        let chunk = b"Hello \x1b[1;32mWorld\x1b[0m! Line with \x1b[38;5;196mcolor\x1b[0m\r\n";
+        let data: Vec<u8> = chunk.repeat(1_048_576 / chunk.len());
+        let iters = 20;
+        let rounds = 4;
+
+        let mut optimized_times = Vec::new();
+        let mut baseline_times = Vec::new();
+
+        for round in 0..rounds {
+            {
+                let mut processor = Processor::default();
+                let mut handler = MockHandler::default();
+                let mut writer = io::sink();
+                for _ in 0..3 {
+                    processor.parse_bytes(&mut handler, &data, &mut writer);
+                }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    processor.parse_bytes(black_box(&mut handler), black_box(&data), &mut writer);
+                }
+                optimized_times.push(start.elapsed() / iters);
+            }
+
+            {
+                let mut processor = Processor::default();
+                let mut handler = MockHandler::default();
+                let mut writer = io::sink();
+                for _ in 0..3 {
+                    for &byte in data.iter() {
+                        processor.parse_byte(&mut handler, &mut writer, byte);
+                    }
+                }
+                let start = Instant::now();
+                for _ in 0..iters {
+                    for &byte in black_box(&data).iter() {
+                        processor.parse_byte(black_box(&mut handler), &mut writer, *black_box(&byte));
+                    }
+                }
+                baseline_times.push(start.elapsed() / iters);
+            }
+
+            eprintln!("  Round {}: optimized={:?}, baseline={:?}",
+                round + 1,
+                optimized_times.last().unwrap(),
+                baseline_times.last().unwrap());
+        }
+
+        let opt_avg: std::time::Duration = optimized_times.iter().sum::<std::time::Duration>() / rounds;
+        let base_avg: std::time::Duration = baseline_times.iter().sum::<std::time::Duration>() / rounds;
+        let speedup = base_avg.as_nanos() as f64 / opt_avg.as_nanos() as f64;
+        let throughput_opt = (data.len() as f64) / opt_avg.as_secs_f64() / 1e9;
+        let throughput_base = (data.len() as f64) / base_avg.as_secs_f64() / 1e9;
+        eprintln!("\nA/B MIXED ({}B payload):", data.len());
+        eprintln!("  Optimized: {:?}/iter ({:.3} GB/s)", opt_avg, throughput_opt);
+        eprintln!("  Baseline:  {:?}/iter ({:.3} GB/s)", base_avg, throughput_base);
+        eprintln!("  Speedup:   {:.2}x", speedup);
+    }
+
+}
+
+
+#[cfg(test)]
+mod differential_tests {
+    use super::*;
+    use std::io;
+
+    struct TracingHandler {
+        events: Vec<Event>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Event {
+        Input(char),
+        Goto(VisibleRow, usize),
+        GotoLine(VisibleRow),
+        GotoCol(usize),
+        SetColor(usize),
+        SetMode,
+        UnsetMode,
+        Attr(Attr),
+        CursorStyle,
+        Linefeed,
+        CarriageReturn,
+        Bell,
+        Backspace,
+        MoveUp(usize),
+        MoveDown(usize),
+        MoveForward(usize),
+        MoveBackward(usize),
+        EraseChars(usize),
+        DeleteChars(usize),
+        InsertBlank(usize),
+        ClearLine,
+        ClearScreen,
+        ScrollUp(usize),
+        ScrollDown(usize),
+        ReverseIndex,
+        SetTitle,
+    }
+
+    impl Default for TracingHandler {
+        fn default() -> Self { Self { events: Vec::new() } }
+    }
+
+    impl Handler for TracingHandler {
+        fn input(&mut self, c: char) { self.events.push(Event::Input(c)); }
+        fn goto(&mut self, row: VisibleRow, col: usize) { self.events.push(Event::Goto(row, col)); }
+        fn goto_line(&mut self, row: VisibleRow) { self.events.push(Event::GotoLine(row)); }
+        fn goto_col(&mut self, col: usize) { self.events.push(Event::GotoCol(col)); }
+        fn terminal_attribute(&mut self, attr: Attr) { self.events.push(Event::Attr(attr)); }
+        fn set_cursor_style(&mut self, _: Option<super::CursorStyle>) { self.events.push(Event::CursorStyle); }
+        fn set_cursor_shape(&mut self, _: super::CursorShape) {}
+        fn insert_blank(&mut self, n: usize) { self.events.push(Event::InsertBlank(n)); }
+        fn move_up(&mut self, n: usize) { self.events.push(Event::MoveUp(n)); }
+        fn move_down(&mut self, n: usize) { self.events.push(Event::MoveDown(n)); }
+        fn identify_terminal<W: io::Write>(&mut self, _: &mut W, _: Option<char>) {}
+        fn report_xtversion<W: io::Write>(&mut self, _: &mut W) {}
+        fn device_status<W: io::Write>(&mut self, _: &mut W, _: usize) {}
+        fn move_forward(&mut self, n: usize) { self.events.push(Event::MoveForward(n)); }
+        fn move_backward(&mut self, n: usize) { self.events.push(Event::MoveBackward(n)); }
+        fn move_down_and_cr(&mut self, _: usize) {}
+        fn move_up_and_cr(&mut self, _: usize) {}
+        fn put_tab(&mut self, _: u16) {}
+        fn backspace(&mut self) { self.events.push(Event::Backspace); }
+        fn carriage_return(&mut self) { self.events.push(Event::CarriageReturn); }
+        fn linefeed(&mut self) -> ScrollDelta { self.events.push(Event::Linefeed); ScrollDelta::zero() }
+        fn bell(&mut self) { self.events.push(Event::Bell); }
+        fn substitute(&mut self) {}
+        fn newline(&mut self) {}
+        fn set_horizontal_tabstop(&mut self) {}
+        fn scroll_up(&mut self, n: usize) -> ScrollDelta { self.events.push(Event::ScrollUp(n)); ScrollDelta::zero() }
+        fn scroll_down(&mut self, n: usize) -> ScrollDelta { self.events.push(Event::ScrollDown(n)); ScrollDelta::zero() }
+        fn insert_blank_lines(&mut self, _: usize) -> ScrollDelta { ScrollDelta::zero() }
+        fn delete_lines(&mut self, _: usize) -> ScrollDelta { ScrollDelta::zero() }
+        fn erase_chars(&mut self, n: usize) { self.events.push(Event::EraseChars(n)); }
+        fn delete_chars(&mut self, n: usize) { self.events.push(Event::DeleteChars(n)); }
+        fn move_backward_tabs(&mut self, _: u16) {}
+        fn move_forward_tabs(&mut self, _: u16) {}
+        fn save_cursor_position(&mut self) {}
+        fn restore_cursor_position(&mut self) {}
+        fn clear_line(&mut self, _: super::LineClearMode) { self.events.push(Event::ClearLine); }
+        fn clear_screen(&mut self, _: super::ClearMode) { self.events.push(Event::ClearScreen); }
+        fn clear_tabs(&mut self, _: super::TabulationClearMode) {}
+        fn reset_state(&mut self) { self.events.clear(); }
+        fn reverse_index(&mut self) -> ScrollDelta { self.events.push(Event::ReverseIndex); ScrollDelta::zero() }
+        fn set_mode(&mut self, _: super::Mode) { self.events.push(Event::SetMode); }
+        fn unset_mode(&mut self, _: super::Mode) { self.events.push(Event::UnsetMode); }
+        fn set_scrolling_region(&mut self, _: usize, _: Option<usize>) {}
+        fn set_keypad_application_mode(&mut self) {}
+        fn unset_keypad_application_mode(&mut self) {}
+        fn set_active_charset(&mut self, _: CharsetIndex) {}
+        fn configure_charset(&mut self, _: CharsetIndex, _: StandardCharset) {}
+        fn set_color(&mut self, idx: usize, _: ColorU) { self.events.push(Event::SetColor(idx)); }
+        fn dynamic_color_sequence<W: io::Write>(&mut self, _: &mut W, _: u8, _: usize, _: &str) {}
+        fn reset_color(&mut self, _: usize) {}
+        fn clipboard_store(&mut self, _: u8, _: &[u8]) {}
+        fn clipboard_load(&mut self, _: u8, _: &str) {}
+        fn decaln(&mut self) {}
+        fn push_title(&mut self) {}
+        fn pop_title(&mut self) {}
+        fn text_area_size_pixels<W: io::Write>(&mut self, _: &mut W) {}
+        fn text_area_size_chars<W: io::Write>(&mut self, _: &mut W) {}
+        fn set_title(&mut self, _: Option<String>) { self.events.push(Event::SetTitle); }
+        fn set_keyboard_enhancement_flags(&mut self, _: KeyboardModes, _: KeyboardModesApplyBehavior) {}
+        fn push_keyboard_enhancement_flags(&mut self, _: KeyboardModes) {}
+        fn pop_keyboard_enhancement_flags(&mut self, _: u16) {}
+        fn query_keyboard_enhancement_flags<W: io::Write>(&mut self, _: &mut W) {}
+    }
+
+    fn run_optimized(data: &[u8]) -> Vec<Event> {
+        let mut processor = Processor::default();
+        let mut handler = TracingHandler::default();
+        let mut writer = io::sink();
+        processor.parse_bytes(&mut handler, data, &mut writer);
+        handler.events
+    }
+
+    fn run_baseline(data: &[u8]) -> Vec<Event> {
+        let mut processor = Processor::default();
+        let mut handler = TracingHandler::default();
+        let mut writer = io::sink();
+        for &byte in data {
+            processor.parse_byte(&mut handler, &mut writer, byte);
+        }
+        handler.events
+    }
+
+    #[test]
+    fn differential_pure_ascii() {
+        let data: Vec<u8> = (0..10000).map(|i| b'A' + (i % 26) as u8).collect();
+        assert_eq!(run_optimized(&data), run_baseline(&data));
+    }
+
+    #[test]
+    fn differential_ascii_with_newlines() {
+        let mut data = Vec::new();
+        for i in 0..1000 {
+            data.extend_from_slice(b"Hello world line ");
+            data.extend_from_slice(i.to_string().as_bytes());
+            data.push(0x0A);
+        }
+        assert_eq!(run_optimized(&data), run_baseline(&data));
+    }
+
+    #[test]
+    fn differential_csi_cursor_movement() {
+        let mut data = Vec::new();
+        for row in 1..50 {
+            for col in 1..80 {
+                // ESC[row;colH (cursor position)
+                data.extend_from_slice(format!("[{row};{col}H").as_bytes());
+                data.push(b'X');
+            }
+        }
+        assert_eq!(run_optimized(&data), run_baseline(&data));
+    }
+
+    #[test]
+    fn differential_csi_sgr_sequences() {
+        let mut data = Vec::new();
+        // Various SGR (Select Graphic Rendition) sequences
+        let sgr_codes = [
+            "0", "1", "4", "7", "22", "24", "27",
+            "30", "31", "32", "33", "34", "35", "36", "37",
+            "38;5;196", "38;2;255;128;0",
+            "40", "41", "48;5;21", "48;2;0;128;255",
+        ];
+        for code in &sgr_codes {
+            data.extend_from_slice(format!("[{code}m").as_bytes());
+            data.extend_from_slice(b"colored text ");
+        }
+        data.extend_from_slice(b"[0m");
+        assert_eq!(run_optimized(&data), run_baseline(&data));
+    }
+
+    #[test]
+    fn differential_mixed_content() {
+        let mut data = Vec::new();
+        for i in 0..500 {
+            match i % 7 {
+                0 => data.extend_from_slice(b"plain ascii text
+"),
+                1 => data.extend_from_slice(b"[1;1H"),  // cursor home
+                2 => data.extend_from_slice(b"[31mred[0m"),
+                3 => data.extend_from_slice(b"[2J"),  // clear screen
+                4 => data.extend_from_slice(b"[K"),   // clear line
+                5 => data.extend_from_slice(b"[5A"),  // move up 5
+                _ => data.extend_from_slice(b"
+line
+"),
+            }
+        }
+        assert_eq!(run_optimized(&data), run_baseline(&data));
+    }
+
+    #[test]
+    fn differential_boundary_ascii_to_escape() {
+        // Test transitions at exact boundary between ASCII run and escape
+        let cases: &[&[u8]] = &[
+            b"AAAA[1mBBBB",
+            b"[1mAAAA",
+            b"A[1mB[2mC",
+            b"AAAAAAAAAA[1;2;3;4;5m",
+            b"[1m[2m[3mX",
+            b"test[38;2;100;200;50mcolor",
+        ];
+        for case in cases {
+            let opt = run_optimized(case);
+            let base = run_baseline(case);
+            assert_eq!(opt, base, "mismatch on input: {:?}", String::from_utf8_lossy(case));
+        }
+    }
+
+    #[test]
+    fn differential_private_mode_sequences() {
+        // DEC private mode sequences (ESC[?...)
+        let data = b"[?25h[?25l[?1049h[?1049l[?2004h[?2004l";
+        assert_eq!(run_optimized(data), run_baseline(data));
+    }
+
+    #[test]
+    fn differential_random_bytes() {
+        // Pseudo-random byte sequences stress-test all parser paths
+        let mut rng: u64 = 0x12345678;
+        for _ in 0..50 {
+            let len = 100 + (rng % 5000) as usize;
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            let data: Vec<u8> = (0..len).map(|_| {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                (rng & 0xFF) as u8
+            }).collect();
+            let opt = run_optimized(&data);
+            let base = run_baseline(&data);
+            assert_eq!(opt.len(), base.len(),
+                "event count mismatch on random input (seed produced {} vs {} events)",
+                opt.len(), base.len());
+            assert_eq!(opt, base, "event mismatch on random byte input");
+        }
+    }
+}
