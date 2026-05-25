@@ -851,7 +851,7 @@ impl EntryBuilder {
                 if cell_width > 1 && self.num_cells != index.columns {
                     self.add_leading_wide_char_spacer();
                 }
-                std::mem::take(self).append_to_index(index);
+                self.flush_to_index(index);
 
                 // If the grapheme is wider than the entire column width it
                 // can never fit via normal packing. Emit one grapheme per row
@@ -872,7 +872,7 @@ impl EntryBuilder {
                         if remaining > 1 {
                             self.add_leading_wide_char_spacer();
                         }
-                        std::mem::take(self).append_to_index(index);
+                        self.flush_to_index(index);
                         remaining -= 1;
                     }
                     return;
@@ -903,7 +903,7 @@ impl EntryBuilder {
 
             // If the row is now full and there are more graphemes, flush.
             if self.num_cells >= index.columns && remaining > 0 {
-                std::mem::take(self).append_to_index(index);
+                self.flush_to_index(index);
             }
         }
     }
