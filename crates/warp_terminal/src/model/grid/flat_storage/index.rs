@@ -141,10 +141,9 @@ impl Index {
                 }
             }
 
-            // Fast path D: uniform single-byte run with carry-over from the
-            // previous row — arithmetic split without per-grapheme processing.
-            // Wide chars are excluded because their leading-spacer semantics
-            // require the full process_graphemes_batch logic.
+            // Fast path D: uniform run (cell_width 1 or 2) with carry-over
+            // from a previous soft-wrapped row — arithmetic split without
+            // per-grapheme processing.
             if let GraphemeSizing::Uniform(run) = &entry.grapheme_sizing {
                 if try_emit_carryover_uniform(
                     run,
@@ -874,6 +873,9 @@ fn emit_narrowed_uniform(run: &GraphemeRun, index: &mut Index) {
     let graphemes_per_row = index.columns / cell_width;
     let byte_len = run.info.utf8_bytes.get() as usize;
     let mut rem = run.count.get() as usize;
+    // A full row of wide chars leaves a 1-cell gap when columns is odd.
+    // The last cell becomes a leading-wide-char-spacer placeholder.
+    let full_row_spacer = cell_width == 2 && index.columns % 2 == 1;
 
     while rem > graphemes_per_row {
         let content_offset: ByteOffset = index.content_len.into();
@@ -885,12 +887,14 @@ fn emit_narrowed_uniform(run: &GraphemeRun, index: &mut Index) {
                 info: run.info,
             }),
             has_trailing_newline: false,
-            ends_with_leading_wide_char_spacer: false,
+            ends_with_leading_wide_char_spacer: full_row_spacer,
         });
         rem -= graphemes_per_row;
     }
     // The loop condition `rem > graphemes_per_row` guarantees rem >= 1.
     debug_assert!(rem > 0);
+    // The final row ends with a trailing newline, not a wide-char overflow,
+    // so ends_with_leading_wide_char_spacer is always false here.
     let content_offset: ByteOffset = index.content_len.into();
     index.content_len += rem * byte_len + 1; // +1 for newline
     index.rows.push_back(Entry {

@@ -1006,6 +1006,49 @@ mod differential_tests {
         }
     }
 
+    /// Regression test: `emit_narrowed_uniform` (fast path A) must set
+    /// `ends_with_leading_wide_char_spacer` on inner loop rows when the column
+    /// count is odd and cell_width == 2.
+    ///
+    /// A full row of wide chars fills `(columns / 2) * 2 = columns - 1` cells,
+    /// leaving a 1-cell gap that acts as a leading-wide-char-spacer.
+    /// Previously the flag was hardcoded to `false`, causing a mismatch with
+    /// the baseline (`process_graphemes_batch`) which correctly sets it.
+    #[test]
+    fn narrowed_uniform_wide_char_spacer_odd_columns() {
+        // (old_cols, new_cols, wide_count): source has wide_count wide chars
+        // with a trailing newline, rebuild to an odd new_cols that forces
+        // multiple full-row emits through emit_narrowed_uniform.
+        let cases: &[(usize, usize, usize)] = &[
+            (20, 7, 10),  // 10 wide → 3+3+4 rows at new=7 (each full row needs spacer)
+            (20, 5, 10),  // 10 wide → 5+5 rows at new=5 (even cols, no spacer)
+            (30, 7, 15),  // 15 wide → 3+3+3+3+3 at new=7, each full row needs spacer
+            (30, 9, 15),  // 15 wide → 4+4+4+3 at new=9 (odd cols, spacer on full rows)
+            (20, 3, 10),  // extreme narrowing, odd cols
+            (10, 7, 5),   // minimal: 5 wide → 3+2, first full row needs spacer
+        ];
+
+        for &(old_cols, new_cols, wide_count) in cases {
+            let mut index = Index::new(old_cols, Some(1));
+            let mut eb = index.start_row();
+            for _ in 0..wide_count {
+                eb.process_grapheme_info_unchecked(EMOJI_GRAPHEME_INFO);
+            }
+            eb.add_trailing_newline();
+            eb.append_to_index(&mut index);
+
+            let optimized = Index::rebuild(&index, new_cols);
+            let baseline = Index::rebuild_baseline(&index, new_cols);
+            assert_indexes_equal(
+                &optimized,
+                &baseline,
+                &format!(
+                    "narrowed wide-char spacer: old={old_cols}, new={new_cols}, count={wide_count}"
+                ),
+            );
+        }
+    }
+
     /// Regression test: narrowing fast path must preserve `content_len` when
     /// `count` is an exact multiple of `graphemes_per_row`.
     ///
