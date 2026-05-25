@@ -263,6 +263,40 @@ fn test_push_extra_row_onto_index_with_softwrapped_first_line() {
 }
 
 #[test]
+fn test_truncate_front_clamps_count() {
+    let mut index = Index::new(5, Some(2));
+
+    let mut eb = index.start_row();
+    eb.process_grapheme_info_unchecked(ASCII_GRAPHEME_INFO);
+    eb.add_trailing_newline();
+    eb.append_to_index(&mut index);
+
+    let mut eb = index.start_row();
+    eb.process_grapheme_info_unchecked(ASCII_GRAPHEME_INFO);
+    eb.add_trailing_newline();
+    eb.append_to_index(&mut index);
+
+    let new_start_offset = index.truncate_front(99);
+
+    assert_eq!(new_start_offset, ByteOffset::from(4));
+    assert_eq!(index.len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "should not have more than 2^16 graphemes in a single row")]
+fn test_rebuild_panics_on_run_count_overflow() {
+    let mut index = Index::new(1, Some(u16::MAX as usize + 1));
+
+    for _ in 0..=(u16::MAX as usize) {
+        let mut eb = index.start_row();
+        eb.process_grapheme_info_unchecked(ASCII_GRAPHEME_INFO);
+        eb.append_to_index(&mut index);
+    }
+
+    let _ = Index::rebuild(&index, u16::MAX as usize + 1);
+}
+
+#[test]
 fn test_cell_type() {
     // 1: 😀😃
     // 2: 😄\n

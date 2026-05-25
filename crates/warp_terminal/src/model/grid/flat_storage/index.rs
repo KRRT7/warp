@@ -222,6 +222,7 @@ impl Index {
     /// Removes the first `count` rows from the index, returning the new start
     /// offset for the remaining content.
     pub fn truncate_front(&mut self, count: usize) -> ByteOffset {
+        let bounded_count = count.min(self.rows.len());
         let new_start_offset = self.content_offset_for_row(count).unwrap_or_else(|| {
             if count > self.rows.len() {
                 log::error!(
@@ -234,7 +235,7 @@ impl Index {
             self.content_len.into()
         });
 
-        self.rows.drain(..count);
+        self.rows.drain(..bounded_count);
         self.grapheme_sizing = self.grapheme_sizing.split_off(&new_start_offset);
 
         new_start_offset
@@ -575,7 +576,7 @@ impl EntryBuilder {
         // Store information about this grapheme's cell width and UTF-8 length.
         match self.grapheme_runs.last_mut() {
             Some(last_run) if last_run.info == info => {
-                last_run.count = last_run.count.saturating_add(1);
+                checked_add_run_count(&mut last_run.count, 1);
             }
             _ => {
                 self.grapheme_runs.push(GraphemeRun {
@@ -648,7 +649,7 @@ impl EntryBuilder {
 
             match self.grapheme_runs.last_mut() {
                 Some(last) if last.info == info => {
-                    last.count = last.count.saturating_add(take_u16.get());
+                    checked_add_run_count(&mut last.count, take_u16.get());
                 }
                 _ => {
                     self.grapheme_runs.push(GraphemeRun {
@@ -780,10 +781,12 @@ impl EntryBuilder {
 impl Drop for EntryBuilder {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
-        debug_assert!(
-            self.was_processed,
-            "EntryBuilder must be processed before it is dropped"
-        );
+        if !std::thread::panicking() {
+            debug_assert!(
+                self.was_processed,
+                "EntryBuilder must be processed before it is dropped"
+            );
+        }
     }
 }
 
@@ -982,7 +985,7 @@ fn try_accumulate_softwrap(
                     run.count.get() as usize * run.info.utf8_bytes.get() as usize;
                 match entry_builder.grapheme_runs.last_mut() {
                     Some(last) if last.info == run.info => {
-                        last.count = last.count.saturating_add(run.count.get());
+                        checked_add_run_count(&mut last.count, run.count.get());
                     }
                     _ => entry_builder.grapheme_runs.push(*run),
                 }
@@ -1072,7 +1075,7 @@ fn try_emit_carryover_uniform(
             entry_builder.incr_content_offset += count * byte_len;
             match entry_builder.grapheme_runs.last_mut() {
                 Some(last) if last.info == run.info => {
-                    last.count = last.count.saturating_add(count as u16);
+                    checked_add_run_count(&mut last.count, count as u16);
                 }
                 _ => entry_builder.grapheme_runs.push(*run),
             }
@@ -1094,7 +1097,7 @@ fn try_emit_carryover_uniform(
         entry_builder.incr_content_offset += remaining_graphemes * byte_len;
         match entry_builder.grapheme_runs.last_mut() {
             Some(last) if last.info == run.info => {
-                last.count = last.count.saturating_add(remaining_graphemes as u16);
+                checked_add_run_count(&mut last.count, remaining_graphemes as u16);
             }
             _ => entry_builder.grapheme_runs.push(GraphemeRun {
                 count: NonZeroU16::new(remaining_graphemes as u16).unwrap(),
@@ -1143,7 +1146,7 @@ fn try_emit_carryover_uniform(
         entry_builder.incr_content_offset += count * byte_len;
         match entry_builder.grapheme_runs.last_mut() {
             Some(last) if last.info == run.info => {
-                last.count = last.count.saturating_add(count as u16);
+                checked_add_run_count(&mut last.count, count as u16);
             }
             _ => entry_builder.grapheme_runs.push(*run),
         }
@@ -1205,7 +1208,7 @@ fn emit_runs(
             // extend the rest in one slice copy.
             let skip_first = if let Some(last) = entry_builder.grapheme_runs.last_mut() {
                 if last.info == fitting[0].info {
-                    last.count = last.count.saturating_add(fitting[0].count.get());
+                    checked_add_run_count(&mut last.count, fitting[0].count.get());
                     true
                 } else {
                     false
@@ -1230,6 +1233,12 @@ fn emit_runs(
         entry_builder.add_trailing_newline();
         entry_builder.flush_to_index(index);
     }
+}
+
+fn checked_add_run_count(count: &mut NonZeroU16, add: u16) {
+    *count = count
+        .checked_add(add)
+        .expect("should not have more than 2^16 graphemes in a single row");
 }
 
 #[cfg(test)]
