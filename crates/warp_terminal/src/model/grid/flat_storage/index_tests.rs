@@ -829,4 +829,68 @@ mod differential_tests {
             );
         }
     }
+
+    /// Regression test: narrowing fast path must preserve `content_len` when
+    /// `count` is an exact multiple of `graphemes_per_row`.
+    ///
+    /// Because the loop uses `while rem > graphemes_per_row` (strict), `rem`
+    /// exits in `[1, graphemes_per_row]` and the `else` branch is technically
+    /// unreachable today.  The fix restructures the code so `content_len` is
+    /// only incremented inside the branch that actually pushes a row, making
+    /// the intent clear and preventing a real double-count if the loop
+    /// condition is ever relaxed to `>=`.
+    #[test]
+    fn narrowing_uniform_exactly_divisible_newline() {
+        // Build several source indexes whose rows divide evenly at the new
+        // column width, so the narrowing fast path always lands in the
+        // `rem == 0` branch.
+        let ascii_info = GraphemeInfo {
+            cell_width: 1,
+            utf8_bytes: NonZeroU16::new(1).unwrap(),
+        };
+
+        // (old_cols, new_cols) pairs where old_cols % new_cols == 0
+        let cases: &[(usize, usize)] = &[
+            (80, 40),
+            (80, 20),
+            (80, 10),
+            (80, 8),
+            (80, 5),
+            (80, 4),
+            (100, 50),
+            (100, 25),
+            (120, 60),
+            (120, 40),
+            (120, 30),
+            (120, 24),
+        ];
+
+        for &(old_cols, new_cols) in cases {
+            // Single row, fully packed, with a trailing newline.
+            let mut index = Index::new(old_cols, Some(1));
+            let mut eb = index.start_row();
+            for _ in 0..old_cols {
+                eb.process_grapheme_info_unchecked(ascii_info);
+            }
+            eb.add_trailing_newline();
+            eb.append_to_index(&mut index);
+
+            let optimized = Index::rebuild(&index, new_cols);
+            let baseline = Index::rebuild_baseline(&index, new_cols);
+
+            assert_indexes_equal(
+                &optimized,
+                &baseline,
+                &format!("divisible narrowing: {old_cols}->{new_cols}"),
+            );
+
+            // Also verify the total byte count is preserved.
+            assert_eq!(
+                optimized.content_len, index.content_len,
+                "content_len not preserved for {old_cols}->{new_cols}: \
+                 optimized={}, original={}",
+                optimized.content_len, index.content_len
+            );
+        }
+    }
 }

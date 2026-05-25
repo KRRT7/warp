@@ -140,26 +140,20 @@ impl Index {
                             });
                             rem -= graphemes_per_row;
                         }
-                        // Last partial row with newline
+                        // The loop condition is `rem > graphemes_per_row`, so
+                        // rem exits in [1, graphemes_per_row] — never zero.
+                        debug_assert!(rem > 0, "rem should never be zero here");
                         let content_offset: ByteOffset = index.content_len.into();
                         index.content_len += rem * byte_len + 1; // +1 for newline
-                        if rem > 0 {
-                            index.rows.push_back(Entry {
-                                content_offset,
-                                grapheme_sizing: GraphemeSizing::Uniform(GraphemeRun {
-                                    count: NonZeroU16::new(rem as u16).unwrap(),
-                                    info: run.info,
-                                }),
-                                has_trailing_newline: true,
-                                ends_with_leading_wide_char_spacer: false,
-                            });
-                        } else {
-                            // All cells consumed evenly; mark last emitted row with newline
-                            if let Some(last) = index.rows.back_mut() {
-                                last.has_trailing_newline = true;
-                                index.content_len += 1; // newline byte
-                            }
-                        }
+                        index.rows.push_back(Entry {
+                            content_offset,
+                            grapheme_sizing: GraphemeSizing::Uniform(GraphemeRun {
+                                count: NonZeroU16::new(rem as u16).unwrap(),
+                                info: run.info,
+                            }),
+                            has_trailing_newline: true,
+                            ends_with_leading_wide_char_spacer: false,
+                        });
                         continue;
                     }
                 }
