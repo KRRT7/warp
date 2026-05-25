@@ -19,11 +19,9 @@
 //! in the entire flat storage implementation that should be keyed on anything
 //! other than content offsets is the [`rows`](Index::rows) field of the index.
 
-use std::{
-    collections::{BTreeMap, VecDeque},
-    num::NonZeroU16,
-    ops::Range,
-};
+use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroU16;
+use std::ops::Range;
 
 use cfg_if::cfg_if;
 use get_size::GetSize;
@@ -31,7 +29,6 @@ use string_offset::ByteOffset;
 use thiserror::Error;
 
 use crate::model::{grid::CellType, Point};
-
 
 #[derive(Debug, Clone, GetSize)]
 /// A structure to help index into a grid's content by (soft-wrapped) row.
