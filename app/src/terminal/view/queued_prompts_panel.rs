@@ -18,11 +18,13 @@ use warpui::elements::{
     Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ConstrainedBox, Container,
     CornerRadius, CrossAxisAlignment, DragAxis, Draggable, DraggableState, Empty, Expanded, Fill,
     Flex, Hoverable, MinSize, MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement,
-    ParentOffsetBounds, Radius, SavePosition, ScrollbarWidth, Stack, Text,
+    ParentOffsetBounds, Radius, SavePosition, ScrollbarWidth, Shrinkable, Stack, Text,
     DEFAULT_UI_LINE_HEIGHT_RATIO,
 };
 use warpui::fonts::{Properties, Style, Weight};
+use warpui::keymap::Keystroke;
 use warpui::platform::Cursor;
+use warpui::text_layout::ClipConfig;
 use warpui::ui_components::components::UiComponent;
 use warpui::{
     AppContext, BlurContext, Element, Entity, EntityId, FocusContext, ModelHandle, SingletonEntity,
@@ -30,6 +32,8 @@ use warpui::{
 };
 
 use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::blocklist::agent_view::shortcuts::render_keystroke_with_color_overrides;
+use crate::ai::blocklist::block::cli_controller::{CLISubagentController, CLISubagentEvent};
 use crate::ai::blocklist::{
     BlocklistAIHistoryEvent, BlocklistAIHistoryModel, QueuedQueryEvent, QueuedQueryId,
     QueuedQueryModel, QueuedQueryOrigin,
@@ -41,15 +45,25 @@ use crate::editor::{
 };
 use crate::send_telemetry_from_ctx;
 use crate::server::telemetry::TelemetryEvent;
+use crate::terminal::cli_agent_sessions::{CLIAgentSessionsModel, CLIAgentSessionsModelEvent};
 use crate::terminal::input::suggestions_mode_model::InputSuggestionsModeModel;
 use crate::ui_components::icons::Icon as TerminalIcon;
 use crate::util::truncation::truncate_from_end;
 use crate::view_components::action_button::{ActionButton, ButtonSize, NakedTheme};
 
 const MAX_PROMPT_LINES: f32 = 5.;
+/// Max characters shown in a row's single-line preview before truncation.
+const PROMPT_PREVIEW_MAX_CHARS: usize = 500;
 const INITIAL_CLOUD_MODE_PROMPT_TOOLTIP: &str = "The first cloud-mode prompt cannot be changed.";
 const SEND_NOW_DURING_CLOUD_SETUP_TOOLTIP: &str =
     "Prompts cannot be sent until environment setup is complete.";
+const SEND_NOW_PENDING_LRC_TOOLTIP: &str =
+    "Prompts cannot be sent until the full terminal use agent is initialized.";
+const SEND_NOW_TO_FULL_TERMINAL_USE_AGENT_TOOLTIP: &str = "Send to full terminal use agent";
+const SEND_NOW_AS_READ_ONLY_VIEWER_TOOLTIP: &str = "Read-only viewers cannot send prompts.";
+/// Suffix on rows auto-queued during an agent-requested long-running command, which fire
+/// when that command completes rather than at the end of the full response.
+const LRC_AUTO_QUEUE_ROW_SUFFIX: &str = "(queued until the command finishes)";
 
 /// Returns the position-cache id used to look up a row's bounding rect during a drag.
 /// Indexed by the row's current visual index so swaps maintain stable lookups.
@@ -60,6 +74,7 @@ fn queue_row_position_id(panel_view_id: EntityId, index: usize) -> String {
 fn build_row_state(
     query_id: QueuedQueryId,
     origin: QueuedQueryOrigin,
+    text: &str,
     ctx: &mut ViewContext<QueuedPromptsPanelView>,
 ) -> QueuedPromptRowState {
     let is_initial_cloud_mode_prompt = origin == QueuedQueryOrigin::InitialCloudMode;
@@ -111,6 +126,10 @@ fn build_row_state(
     }
 
     QueuedPromptRowState {
+        preview_text: truncate_from_end(
+            &text.lines().collect::<Vec<_>>().join(" "),
+            PROMPT_PREVIEW_MAX_CHARS,
+        ),
         mouse_state: MouseStateHandle::default(),
         drag_handle_tooltip_state: MouseStateHandle::default(),
         send_now_button,
@@ -122,6 +141,8 @@ fn build_row_state(
 
 #[derive(Clone)]
 struct QueuedPromptRowState {
+    /// Cached single-line preview; refreshed only when the row's text changes.
+    preview_text: String,
     mouse_state: MouseStateHandle,
     drag_handle_tooltip_state: MouseStateHandle,
     send_now_button: ViewHandle<ActionButton>,
@@ -150,10 +171,22 @@ pub struct QueuedPromptsPanelView {
     /// because no other view reads this. Reset whenever the active conversation changes or the
     /// queue is cleared.
     collapsed: bool,
+    /// Host-pushed: whether this terminal can send prompts at all (false for read-only
+    /// shared-session viewers). Gates the send-now buttons, empty-Enter sends, and the hint.
+    can_send_prompt: bool,
+    /// Host input's editor. An empty input is what makes Enter send the top queued row, so
+    /// Enter-send and hint decisions read its emptiness live.
+    host_editor: ViewHandle<EditorView>,
+    /// Last observed emptiness of `host_editor`; only damps re-render notifications to
+    /// empty <-> non-empty transitions. Decisions always read the editor live.
+    host_editor_was_empty: bool,
     header_mouse_state: MouseStateHandle,
     row_states: HashMap<QueuedQueryId, QueuedPromptRowState>,
     dragging_query_id: Option<QueuedQueryId>,
     drag_start_index: Option<usize>,
+    /// Controller for the active long-running-command subagent (the "full terminal use agent").
+    /// Used to retarget the send-now tooltip while that subagent is in control.
+    cli_subagent_controller: ModelHandle<CLISubagentController>,
 }
 
 #[derive(Clone, Debug)]
@@ -170,11 +203,16 @@ pub enum QueuedPromptsPanelAction {
 /// Events emitted to the host input view.
 #[derive(Clone, Debug)]
 pub enum QueuedPromptsPanelEvent {
-    /// A row was removed via its send-now button. The host should immediately submit `text`.
-    SendNow { text: String },
-    /// A row was deleted via the trash button. The host should place `text` into the input editor
-    /// when the editor is empty, and focus the input.
-    RowDeleted { text: String },
+    /// A row's send-now button was clicked. The row is left in the queue so the host can dispatch
+    /// it according to its kind, read prompt attachments by id, and remove it after dispatch.
+    SendNow {
+        conversation_id: AIConversationId,
+        query_id: QueuedQueryId,
+        text: String,
+        is_command: bool,
+    },
+    /// A row was deleted via the trash button. The host should refocus the input.
+    RowDeleted,
     /// An inline edit was committed or cancelled. The host should refocus the input.
     EditEnded,
 }
@@ -187,12 +225,27 @@ impl QueuedPromptsPanelView {
     pub fn new(
         terminal_view_id: EntityId,
         suggestions_mode_model: ModelHandle<InputSuggestionsModeModel>,
+        cli_subagent_controller: ModelHandle<CLISubagentController>,
+        host_editor: ViewHandle<EditorView>,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
         let edit_editor = build_edit_editor(ctx);
 
         ctx.subscribe_to_view(&edit_editor, |me, _, event, ctx| {
             me.handle_edit_editor_event(event, ctx);
+        });
+
+        // The header hint hides while the CLI-agent rich input is open (Enter submits to the
+        // CLI agent there), so re-render when it opens or closes.
+        ctx.subscribe_to_model(&CLIAgentSessionsModel::handle(ctx), |me, _, event, ctx| {
+            me.handle_cli_agent_sessions_event(event, ctx);
+        });
+
+        // Enter-send and the header hint depend on the host input's emptiness, which is read
+        // live from `host_editor`; re-render when the buffer transitions between empty and
+        // non-empty.
+        ctx.subscribe_to_view(&host_editor, |me, _, event, ctx| {
+            me.handle_host_editor_event(event, ctx);
         });
 
         let history_handle = BlocklistAIHistoryModel::handle(ctx);
@@ -208,6 +261,11 @@ impl QueuedPromptsPanelView {
             me.handle_queued_query_event(event, ctx);
         });
 
+        ctx.subscribe_to_model(&cli_subagent_controller, |me, _, event, ctx| {
+            me.handle_cli_subagent_event(event, ctx);
+        });
+
+        let host_editor_was_empty = host_editor.as_ref(ctx).is_empty(ctx);
         let mut me = Self {
             view_id: ctx.view_id(),
             terminal_view_id,
@@ -217,10 +275,14 @@ impl QueuedPromptsPanelView {
             edit_editor_is_single_logical_line: true,
             edit_editor_scroll_state: Default::default(),
             collapsed: false,
+            can_send_prompt: true,
+            host_editor,
+            host_editor_was_empty,
             header_mouse_state: MouseStateHandle::default(),
             row_states: HashMap::new(),
             dragging_query_id: None,
             drag_start_index: None,
+            cli_subagent_controller,
         };
         if let Some(conv_id) = active_conversation_id {
             me.seed_row_states_for(conv_id, ctx);
@@ -233,19 +295,94 @@ impl QueuedPromptsPanelView {
         self.drag_start_index = None;
     }
 
+    /// Updates whether this terminal can send prompts (false for read-only shared-session
+    /// viewers). Pushed by the host on construction and when the shared-session role changes.
+    pub fn set_can_send_prompt(&mut self, can_send_prompt: bool, ctx: &mut ViewContext<Self>) {
+        if self.can_send_prompt == can_send_prompt {
+            return;
+        }
+        self.can_send_prompt = can_send_prompt;
+        self.update_send_now_availability(ctx);
+        ctx.notify();
+    }
+
+    /// True when pressing Enter in the host input should send the top queued row instead of
+    /// performing its usual action: the panel is showing, prompts can be sent, the input is
+    /// empty (read live from the host editor, so the decision cannot trail same-update buffer
+    /// changes), and the CLI-agent rich input is closed (Enter submits to the CLI agent there).
+    pub fn enter_sends_queued_prompt(&self, ctx: &AppContext) -> bool {
+        self.should_render(ctx)
+            && self.can_send_prompt
+            && self.host_editor.as_ref(ctx).is_empty(ctx)
+            && !CLIAgentSessionsModel::as_ref(ctx).is_input_open(self.terminal_view_id)
+    }
+
+    /// Whether the header shows the "⏎ to send" hint: Enter would send, no row is in inline
+    /// edit mode, and the head row is sendable (not the locked initial cloud-mode prompt).
+    fn should_show_enter_hint(&self, ctx: &AppContext) -> bool {
+        let Some(conv_id) = self.active_conversation_id else {
+            return false;
+        };
+        let queue_model = QueuedQueryModel::as_ref(ctx);
+        self.enter_sends_queued_prompt(ctx)
+            && queue_model.editing_row(conv_id).is_none()
+            && queue_model
+                .queue(conv_id)
+                .first()
+                .is_some_and(|row| !row.is_locked())
+    }
+
+    /// Returns whether the reusable inline edit editor is currently holding focus for an active
+    /// queued prompt row. Parent views use this to avoid stealing focus during async AI/tool
+    /// updates.
+    pub(in crate::terminal) fn is_inline_edit_editor_focused(&self, ctx: &AppContext) -> bool {
+        self.editing_row_id(ctx).is_some() && self.edit_editor.is_focused(ctx)
+    }
+
+    /// Re-renders when the host input transitions between empty and non-empty, so the header
+    /// hint tracks whether Enter would send.
+    fn handle_host_editor_event(&mut self, event: &EditorEvent, ctx: &mut ViewContext<Self>) {
+        if !matches!(event, EditorEvent::Edited(_) | EditorEvent::BufferReplaced) {
+            return;
+        }
+        let is_empty = self.host_editor.as_ref(ctx).is_empty(ctx);
+        if is_empty != self.host_editor_was_empty {
+            self.host_editor_was_empty = is_empty;
+            ctx.notify();
+        }
+    }
+
+    /// Re-renders the header hint when the CLI-agent rich input opens or closes for this
+    /// terminal.
+    fn handle_cli_agent_sessions_event(
+        &mut self,
+        event: &CLIAgentSessionsModelEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let CLIAgentSessionsModelEvent::InputSessionChanged {
+            terminal_view_id, ..
+        } = event
+        else {
+            return;
+        };
+        if *terminal_view_id == self.terminal_view_id {
+            ctx.notify();
+        }
+    }
+
     /// Reseed `row_states` for `conv_id`'s queue, dropping any state for rows not in that queue.
     fn seed_row_states_for(&mut self, conv_id: AIConversationId, ctx: &mut ViewContext<Self>) {
-        let rows: Vec<(QueuedQueryId, QueuedQueryOrigin)> = QueuedQueryModel::as_ref(ctx)
+        let rows: Vec<(QueuedQueryId, QueuedQueryOrigin, String)> = QueuedQueryModel::as_ref(ctx)
             .queue(conv_id)
             .iter()
-            .map(|q| (q.id(), q.origin()))
+            .map(|q| (q.id(), q.origin(), q.text().to_owned()))
             .collect();
-        let row_ids: Vec<QueuedQueryId> = rows.iter().map(|(id, _)| *id).collect();
+        let row_ids: Vec<QueuedQueryId> = rows.iter().map(|(id, _, _)| *id).collect();
         self.row_states.retain(|id, _| row_ids.contains(id));
-        for (id, origin) in rows {
+        for (id, origin, text) in rows {
             self.row_states
                 .entry(id)
-                .or_insert_with(|| build_row_state(id, origin, ctx));
+                .or_insert_with(|| build_row_state(id, origin, &text, ctx));
         }
         self.update_send_now_availability(ctx);
     }
@@ -253,7 +390,9 @@ impl QueuedPromptsPanelView {
     /// Updates each row's "send now" button: disabled, with a tooltip explaining the wait, for the
     /// locked initial cloud-mode prompt and for every row while that locked row sits at the head of
     /// the queue — i.e. while the cloud environment is still setting up, with no live agent yet to
-    /// receive an immediate submission. Otherwise it is enabled with the default "Send now" tooltip.
+    /// receive an immediate submission. When a long-running-command subagent (the "full terminal
+    /// use agent") is in control, the enabled tooltip explains that send-now targets that subagent.
+    /// Otherwise it is enabled with the default "Send now" tooltip.
     fn update_send_now_availability(&mut self, ctx: &mut ViewContext<Self>) {
         let Some(conv_id) = self.active_conversation_id else {
             return;
@@ -267,6 +406,10 @@ impl QueuedPromptsPanelView {
         let cloud_setup_in_progress = rows
             .first()
             .is_some_and(|(_, origin)| *origin == QueuedQueryOrigin::InitialCloudMode);
+        let lrc_subagent_in_progress = self
+            .cli_subagent_controller
+            .as_ref(ctx)
+            .is_agent_in_control();
         for (query_id, origin) in &rows {
             let Some(send_now_button) = self
                 .row_states
@@ -275,10 +418,19 @@ impl QueuedPromptsPanelView {
             else {
                 continue;
             };
-            let disabled =
+            let disabled_for_pending_lrc = *origin == QueuedQueryOrigin::PendingLrcAutoQueue;
+            let disabled_for_cloud_setup =
                 *origin == QueuedQueryOrigin::InitialCloudMode || cloud_setup_in_progress;
-            let tooltip = if disabled {
+            let disabled =
+                disabled_for_pending_lrc || disabled_for_cloud_setup || !self.can_send_prompt;
+            let tooltip = if disabled_for_pending_lrc {
+                SEND_NOW_PENDING_LRC_TOOLTIP
+            } else if disabled_for_cloud_setup {
                 SEND_NOW_DURING_CLOUD_SETUP_TOOLTIP
+            } else if !self.can_send_prompt {
+                SEND_NOW_AS_READ_ONLY_VIEWER_TOOLTIP
+            } else if lrc_subagent_in_progress {
+                SEND_NOW_TO_FULL_TERMINAL_USE_AGENT_TOOLTIP
             } else {
                 "Send now"
             };
@@ -289,13 +441,28 @@ impl QueuedPromptsPanelView {
         }
     }
 
+    /// Recomputes send-now availability when the long-running-command subagent's control state
+    /// changes, so the send-now tooltip stays in sync with whether the full terminal use agent
+    /// is currently in control.
+    fn handle_cli_subagent_event(&mut self, event: &CLISubagentEvent, ctx: &mut ViewContext<Self>) {
+        match event {
+            CLISubagentEvent::SpawnedSubagent { .. }
+            | CLISubagentEvent::FinishedSubagent { .. }
+            | CLISubagentEvent::UpdatedControl { .. }
+            | CLISubagentEvent::ControlHandedBackAfterTransfer => {
+                self.update_send_now_availability(ctx);
+            }
+            CLISubagentEvent::UpdatedLastSnapshot | CLISubagentEvent::ToggledHideResponses => {}
+        }
+    }
+
     fn handle_history_event(
         &mut self,
         event: &BlocklistAIHistoryEvent,
         ctx: &mut ViewContext<Self>,
     ) {
         let is_for_this_view = event
-            .terminal_view_id()
+            .terminal_surface_id()
             .is_some_and(|id| id == self.terminal_view_id);
         if !is_for_this_view {
             return;
@@ -327,6 +494,7 @@ impl QueuedPromptsPanelView {
             | QueuedQueryEvent::Removed {
                 conversation_id, ..
             }
+            | QueuedQueryEvent::RowUnlocked { conversation_id }
             | QueuedQueryEvent::Reordered { conversation_id }
             | QueuedQueryEvent::EditEntered {
                 conversation_id, ..
@@ -368,11 +536,27 @@ impl QueuedPromptsPanelView {
                 self.edit_editor_is_single_logical_line = !initial_text.contains('\n');
                 self.edit_editor.update(ctx, |editor, ctx| {
                     editor.system_reset_buffer_text(&initial_text, ctx);
-                    editor.select_all(ctx);
                 });
                 ctx.focus(&self.edit_editor);
             }
-            QueuedQueryEvent::EditCommitted { .. } | QueuedQueryEvent::EditCancelled { .. } => {
+            QueuedQueryEvent::EditCommitted { query_id, .. } => {
+                self.edit_editor.update(ctx, |editor, ctx| {
+                    editor.clear_buffer(ctx);
+                });
+
+                // The row's text changed, so refresh its cached preview.
+                let row = QueuedQueryModel::as_ref(ctx)
+                    .queue(active_conv_id)
+                    .iter()
+                    .find(|row| row.id() == *query_id);
+                if let (Some(row), Some(state)) = (row, self.row_states.get_mut(query_id)) {
+                    state.preview_text = truncate_from_end(
+                        &row.text().lines().collect::<Vec<_>>().join(" "),
+                        PROMPT_PREVIEW_MAX_CHARS,
+                    );
+                }
+            }
+            QueuedQueryEvent::EditCancelled { .. } => {
                 self.edit_editor.update(ctx, |editor, ctx| {
                     editor.clear_buffer(ctx);
                 });
@@ -386,17 +570,20 @@ impl QueuedPromptsPanelView {
                 // The row could be gone if the append+remove pair were both delivered
                 // before we observed the append (e.g. fast /queue -> drain). Skip row
                 // state init in that case; the matching Removed event already cleaned up.
-                if let Some(origin) = QueuedQueryModel::as_ref(ctx)
+                if let Some((origin, text)) = QueuedQueryModel::as_ref(ctx)
                     .queue(active_conv_id)
                     .iter()
                     .find(|row| row.id() == *query_id)
-                    .map(|row| row.origin())
+                    .map(|row| (row.origin(), row.text().to_owned()))
                 {
                     self.row_states
                         .entry(*query_id)
-                        .or_insert_with(|| build_row_state(*query_id, origin, ctx));
+                        .or_insert_with(|| build_row_state(*query_id, origin, &text, ctx));
                 }
                 // A new row queued while the locked initial row is present must start disabled.
+                self.update_send_now_availability(ctx);
+            }
+            QueuedQueryEvent::RowUnlocked { .. } => {
                 self.update_send_now_availability(ctx);
             }
             QueuedQueryEvent::Reordered { .. }
@@ -434,7 +621,7 @@ impl QueuedPromptsPanelView {
         QueuedQueryModel::as_ref(ctx).editing_row(conv_id)
     }
 
-    fn commit_edit(&mut self, ctx: &mut ViewContext<Self>) {
+    pub(crate) fn commit_edit(&mut self, ctx: &mut ViewContext<Self>) {
         let Some(conv_id) = self.active_conversation_id else {
             return;
         };
@@ -510,6 +697,22 @@ impl QueuedPromptsPanelView {
             .get(&query_id)
             .map(|state| state.send_now_button.as_ref(ctx).is_disabled())
     }
+
+    /// Test accessor: whether the header currently shows the "⏎ to send" hint.
+    pub(super) fn enter_hint_shown_for_test(&self, ctx: &AppContext) -> bool {
+        self.should_show_enter_hint(ctx)
+    }
+
+    /// Test helper: replaces the inline edit editor buffer.
+    pub(super) fn set_edit_buffer_text_for_test(
+        &mut self,
+        text: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.edit_editor.update(ctx, |editor, ctx| {
+            editor.set_buffer_text(text, ctx);
+        });
+    }
 }
 
 impl TypedActionView for QueuedPromptsPanelView {
@@ -536,11 +739,20 @@ impl TypedActionView for QueuedPromptsPanelView {
                     self.commit_edit(ctx);
                 }
 
-                let removed = QueuedQueryModel::handle(ctx)
-                    .update(ctx, |model, ctx| model.remove_by_id(conv_id, query_id, ctx));
-                if let Some(removed) = removed {
+                // Leave the row in the queue so the host can read its attachments by id when it
+                // fires; the host removes the fired row afterward. Locked rows (the initial
+                // cloud-mode prompt) are not send-now-able.
+                let row = QueuedQueryModel::as_ref(ctx)
+                    .queue(conv_id)
+                    .iter()
+                    .find(|row| row.id() == query_id && !row.is_locked())
+                    .map(|row| (row.text().to_owned(), row.is_command()));
+                if let Some((text, is_command)) = row {
                     ctx.emit(QueuedPromptsPanelEvent::SendNow {
-                        text: removed.text().to_owned(),
+                        conversation_id: conv_id,
+                        query_id,
+                        text,
+                        is_command,
                     });
                 }
             }
@@ -561,9 +773,7 @@ impl TypedActionView for QueuedPromptsPanelView {
                         },
                         ctx
                     );
-                    ctx.emit(QueuedPromptsPanelEvent::RowDeleted {
-                        text: removed.text().to_owned(),
-                    });
+                    ctx.emit(QueuedPromptsPanelEvent::RowDeleted);
                 }
             }
             QueuedPromptsPanelAction::StartDrag(query_id) => {
@@ -663,19 +873,25 @@ impl View for QueuedPromptsPanelView {
             return Empty::new().finish();
         };
 
-        let appearance = Appearance::as_ref(app);
         let queue_model = QueuedQueryModel::as_ref(app);
         let queue: Vec<_> = queue_model.queue(conv_id).to_vec();
         let editing_row_id = queue_model.editing_row(conv_id);
         let collapsed = self.collapsed;
 
         let panel_view_id = self.view_id;
-        let header = render_header(queue.len(), collapsed, &self.header_mouse_state, appearance);
+        let header = render_header(
+            queue.len(),
+            collapsed,
+            self.should_show_enter_hint(app),
+            &self.header_mouse_state,
+            app,
+        );
         let mut panel = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(header);
 
         if !collapsed {
+            let show_drag_handle = queue.len() > 1;
             let mut body = Flex::column();
 
             for (index, query) in queue.iter().enumerate() {
@@ -686,20 +902,23 @@ impl View for QueuedPromptsPanelView {
                     .clone();
                 let is_in_edit_mode = editing_row_id == Some(query.id());
                 let is_being_dragged = self.dragging_query_id == Some(query.id());
-                let row = render_row(RenderRowProps {
-                    query_id: query.id(),
-                    panel_view_id,
-                    index,
-                    text: query.text().to_owned(),
-                    origin: query.origin(),
-                    is_in_edit_mode,
-                    is_being_dragged,
-                    edit_editor: &self.edit_editor,
-                    edit_editor_is_single_logical_line: self.edit_editor_is_single_logical_line,
-                    edit_editor_scroll_state: &self.edit_editor_scroll_state,
-                    row_state,
-                    appearance,
-                });
+                let row = render_row(
+                    RenderRowProps {
+                        query_id: query.id(),
+                        panel_view_id,
+                        index,
+                        origin: query.origin(),
+                        is_command: query.is_command(),
+                        is_in_edit_mode,
+                        is_being_dragged,
+                        show_drag_handle,
+                        edit_editor: &self.edit_editor,
+                        edit_editor_is_single_logical_line: self.edit_editor_is_single_logical_line,
+                        edit_editor_scroll_state: &self.edit_editor_scroll_state,
+                        row_state,
+                    },
+                    app,
+                );
                 body.add_child(row);
             }
 
@@ -717,14 +936,16 @@ impl View for QueuedPromptsPanelView {
 
 fn build_edit_editor(ctx: &mut ViewContext<QueuedPromptsPanelView>) -> ViewHandle<EditorView> {
     let appearance = Appearance::as_ref(ctx);
-    let text_options = TextOptions::ui_text(Some(appearance.ui_font_size()), appearance);
+    // Match the prompt input, which renders at the monospace font size.
+    let text_options = TextOptions::ui_text(Some(appearance.monospace_font_size()), appearance);
     ctx.add_typed_action_view(|ctx| {
         let options = EditorOptions {
             autogrow: true,
             soft_wrap: true,
             text: text_options,
             propagate_and_no_op_escape_key: PropagateAndNoOpEscapeKey::PropagateFirst,
-            propagate_and_no_op_vertical_navigation_keys: PropagateAndNoOpNavigationKeys::Always,
+            // Keep up/down inside the inline editor so they move the cursor between lines.
+            propagate_and_no_op_vertical_navigation_keys: PropagateAndNoOpNavigationKeys::Never,
             propagate_horizontal_navigation_keys: PropagateHorizontalNavigationKeys::AtBoundary,
             ..Default::default()
         };
@@ -776,12 +997,16 @@ fn updated_index_from_vertical_drag(
 fn render_header(
     count: usize,
     collapsed: bool,
+    show_enter_hint: bool,
     header_mouse_state: &MouseStateHandle,
-    appearance: &Appearance,
+    app: &AppContext,
 ) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
     let label_text = header_label_text(count);
     let sub_text_color: ColorU = theme.sub_text_color(theme.surface_1()).into();
+    // The keycap is dimmed relative to the header text so it reads as a secondary affordance.
+    let keycap_color: ColorU = internal_colors::text_disabled(theme, theme.surface_1());
     let banner_background: Fill = theme.surface_overlay_1().into();
     let border_color: Fill = theme.split_pane_border_color().into();
     let chevron_icon = if collapsed {
@@ -805,12 +1030,37 @@ fn render_header(
             .with_color(sub_text_color)
             .with_selectable(false)
             .finish();
-        let row = Flex::row()
+        let mut row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(4.)
             .with_child(chevron)
-            .with_child(label)
-            .finish();
+            .with_child(label);
+        if show_enter_hint {
+            // Follow the message-bar hint spacing conventions (see
+            // `render_message_bar_items`): 8px between the label and the keycap, 4px between
+            // the keycap and its text. The row's 4px flex spacing provides part of each gap.
+            let keycap = render_keystroke_with_color_overrides(
+                &Keystroke {
+                    key: "enter".to_owned(),
+                    ..Default::default()
+                },
+                Some(keycap_color),
+                None,
+                app,
+            );
+            row.add_child(Container::new(keycap).with_margin_left(4.).finish());
+            row.add_child(
+                Text::new("to send", ui_font_family, ui_font_size)
+                    .with_style(Properties {
+                        style: Style::Normal,
+                        weight: Weight::Normal,
+                    })
+                    .with_color(sub_text_color)
+                    .with_selectable(false)
+                    .finish(),
+            );
+        }
+        let row = row.finish();
         Container::new(row)
             .with_horizontal_padding(16.)
             .with_vertical_padding(8.)
@@ -829,46 +1079,47 @@ struct RenderRowProps<'a> {
     query_id: QueuedQueryId,
     panel_view_id: EntityId,
     index: usize,
-    text: String,
     origin: QueuedQueryOrigin,
+    /// Whether this row is a shell command (rendered with a blue `!` prefix) vs an agent prompt.
+    is_command: bool,
     is_in_edit_mode: bool,
     is_being_dragged: bool,
+    show_drag_handle: bool,
     edit_editor: &'a ViewHandle<EditorView>,
     edit_editor_is_single_logical_line: bool,
     edit_editor_scroll_state: &'a ClippedScrollStateHandle,
     row_state: QueuedPromptRowState,
-    appearance: &'a Appearance,
 }
 
-fn render_row(props: RenderRowProps<'_>) -> Box<dyn Element> {
+fn render_row(props: RenderRowProps<'_>, app: &AppContext) -> Box<dyn Element> {
     let RenderRowProps {
         query_id,
         panel_view_id,
         index,
-        text,
         origin,
+        is_command,
         is_in_edit_mode,
         is_being_dragged,
+        show_drag_handle,
         edit_editor,
         edit_editor_is_single_logical_line,
         edit_editor_scroll_state,
         row_state,
-        appearance,
     } = props;
 
+    let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
-    let dimmed_color: ColorU = theme.sub_text_color(theme.surface_1()).into();
-    let foreground_color: ColorU = theme.foreground().into();
-    let row_hover_background: Fill = theme.surface_overlay_1().into();
-    let ui_font_family = appearance.ui_font_family();
-    let ui_font_size = appearance.ui_font_size();
-    let editor_line_height = ui_font_size * DEFAULT_UI_LINE_HEIGHT_RATIO;
-    let max_prompt_height = editor_line_height * MAX_PROMPT_LINES;
-    let preview_text = truncate_from_end(&text, 200);
+    // Match the prompt input, which renders at the monospace font size.
+    let queued_input_font_size = appearance.monospace_font_size();
+    // Blue used for the `!` prefix on command rows, matching shell-mode input styling.
+    let command_prefix_color = theme.ansi_fg_blue();
+
+    let row_action_button_size = ButtonSize::XSmall.button_height(appearance, app);
     let editor_handle = edit_editor.clone();
     let editor_scroll_state = edit_editor_scroll_state.clone();
 
     let QueuedPromptRowState {
+        preview_text,
         mouse_state,
         drag_handle_tooltip_state,
         send_now_button,
@@ -905,30 +1156,84 @@ fn render_row(props: RenderRowProps<'_>) -> Box<dyn Element> {
                     .with_horizontal_padding(4.)
                     .finish(),
             )
-            .with_max_height(max_prompt_height)
+            .with_max_height(
+                queued_input_font_size * DEFAULT_UI_LINE_HEIGHT_RATIO * MAX_PROMPT_LINES,
+            )
             .finish()
         } else {
-            ConstrainedBox::new(
-                Text::new(preview_text.clone(), ui_font_family, ui_font_size)
-                    .with_color(foreground_color)
-                    .with_selectable(false)
-                    .finish(),
+            // Single-line preview that truncates by width with a trailing ellipsis.
+            let preview = Text::new(
+                preview_text.clone(),
+                appearance.ui_font_family(),
+                queued_input_font_size,
             )
-            .with_max_height(max_prompt_height)
-            .finish()
+            .with_color(theme.foreground().into())
+            .with_selectable(false)
+            .soft_wrap(false)
+            .with_clip(ClipConfig::ellipsis())
+            .finish();
+            // Command rows are prefaced with a blue `!` so they read as shell commands; prompt
+            // rows render their text directly. Rows auto-queued during an agent-requested
+            // long-running command carry an italic suffix explaining when they will fire.
+            if is_command {
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(4.)
+                    .with_child(
+                        Text::new("!", appearance.ui_font_family(), queued_input_font_size)
+                            .with_color(command_prefix_color)
+                            .with_selectable(false)
+                            .finish(),
+                    )
+                    .with_child(Expanded::new(1., preview).finish())
+                    .finish()
+            } else if origin == QueuedQueryOrigin::LrcAutoQueue
+                || origin == QueuedQueryOrigin::PendingLrcAutoQueue
+            {
+                let suffix_color: ColorU = theme.sub_text_color(theme.surface_1()).into();
+                let suffix = Text::new(
+                    LRC_AUTO_QUEUE_ROW_SUFFIX.to_owned(),
+                    appearance.ui_font_family(),
+                    queued_input_font_size,
+                )
+                .with_color(suffix_color)
+                .with_style(Properties {
+                    style: Style::Italic,
+                    weight: Weight::Normal,
+                })
+                .with_selectable(false)
+                .soft_wrap(false)
+                .finish();
+                // The preview shrinks to its text (clipping with an ellipsis when long) so the
+                // suffix hugs it, mirroring the model picker's "(selected)" treatment.
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(6.)
+                    .with_child(Shrinkable::new(1., preview).finish())
+                    .with_child(suffix)
+                    .finish()
+            } else {
+                preview
+            }
         };
 
-        let drag_handle: Box<dyn Element> = if origin == QueuedQueryOrigin::InitialCloudMode {
+        let drag_handle: Box<dyn Element> = if !show_drag_handle {
+            // Reserve the handle's footprint without drawing it (single-row queue).
+            ConstrainedBox::new(Empty::new().finish())
+                .with_height(20.)
+                .with_width(20.)
+                .finish()
+        } else if origin == QueuedQueryOrigin::InitialCloudMode {
             let ui_builder = appearance.ui_builder().clone();
             let disabled_color = internal_colors::text_disabled(theme, theme.surface_1());
             Hoverable::new(drag_handle_tooltip_state.clone(), move |drag_state| {
                 let icon = ConstrainedBox::new(
-                    TerminalIcon::DragIndicator
+                    TerminalIcon::DragIndicatorVertical
                         .to_warpui_icon(disabled_color.into())
                         .finish(),
                 )
-                .with_height(24.)
-                .with_width(24.)
+                .with_height(20.)
+                .with_width(20.)
                 .finish();
                 let mut stack = Stack::new().with_child(icon);
                 if drag_state.is_hovered() {
@@ -950,12 +1255,12 @@ fn render_row(props: RenderRowProps<'_>) -> Box<dyn Element> {
             .finish()
         } else {
             ConstrainedBox::new(
-                TerminalIcon::DragIndicator
-                    .to_warpui_icon(dimmed_color.into())
+                TerminalIcon::DragIndicatorVertical
+                    .to_warpui_icon(theme.sub_text_color(theme.surface_1()))
                     .finish(),
             )
-            .with_height(24.)
-            .with_width(24.)
+            .with_height(20.)
+            .with_width(20.)
             .finish()
         };
 
@@ -965,17 +1270,27 @@ fn render_row(props: RenderRowProps<'_>) -> Box<dyn Element> {
             .with_child(drag_handle)
             .with_child(Expanded::new(1., prompt_text_or_editor).finish());
 
-        if state.is_hovered() && !is_being_dragged {
+        // Trailing actions reveal on hover. When hidden, reserve their exact footprint so the
+        // prompt text never reflows. send-now and delete always show; edit only outside edit mode.
+        let show_actions = state.is_hovered() && !is_being_dragged;
+        let action_spacing = 4.;
+        let actions: Box<dyn Element> = if show_actions {
             let mut buttons = Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(4.);
+                .with_spacing(action_spacing);
             buttons.add_child(ChildView::new(&send_now_button).finish());
             if !is_in_edit_mode {
                 buttons.add_child(ChildView::new(&edit_button).finish());
             }
             buttons.add_child(ChildView::new(&delete_button).finish());
-            row.add_child(buttons.finish());
-        }
+            buttons.finish()
+        } else {
+            let count = if is_in_edit_mode { 2. } else { 3. };
+            ConstrainedBox::new(Empty::new().finish())
+                .with_width(count * row_action_button_size + (count - 1.) * action_spacing)
+                .finish()
+        };
+        row.add_child(actions);
 
         let row_content = ConstrainedBox::new(row.finish())
             .with_min_height(32.)
@@ -985,7 +1300,7 @@ fn render_row(props: RenderRowProps<'_>) -> Box<dyn Element> {
             .with_vertical_padding(4.)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
         if is_being_dragged || state.is_hovered() {
-            container = container.with_background(row_hover_background);
+            container = container.with_background(theme.surface_overlay_1());
         }
         container.finish()
     })
@@ -993,7 +1308,7 @@ fn render_row(props: RenderRowProps<'_>) -> Box<dyn Element> {
 
     let position_id = queue_row_position_id(panel_view_id, index);
 
-    if is_in_edit_mode || origin == QueuedQueryOrigin::InitialCloudMode {
+    if is_in_edit_mode || origin == QueuedQueryOrigin::InitialCloudMode || !show_drag_handle {
         return SavePosition::new(row_inner, &position_id).finish();
     }
 

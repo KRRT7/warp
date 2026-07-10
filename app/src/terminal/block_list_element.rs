@@ -60,7 +60,7 @@ use super::view::{
 };
 use super::warpify::render::{draw_flag_pole, render_subshell_flag};
 use super::{heights_approx_eq, TerminalModel, HEIGHT_FUDGE_FACTOR_LINES};
-use crate::ai::blocklist::agent_view::{agent_view_bg_fill, AgentViewState};
+use crate::ai::blocklist::agent_view::AgentViewState;
 use crate::ai::blocklist::{ai_brand_color, ATTACH_AS_AGENT_MODE_CONTEXT_TEXT};
 use crate::ai_assistant::{AI_ASSISTANT_SVG_PATH, ASK_AI_ASSISTANT_TEXT};
 use crate::appearance::Appearance;
@@ -186,6 +186,8 @@ const SPACE_BETWEEN_SELECTED_BLOCK_AVATARS: f32 = 2.;
 
 const CLI_SUBAGENT_HORIZONTAL_MARGIN: f32 = 8.;
 const CLI_SUBAGENT_VERTICAL_MARGIN: f32 = 8.;
+const CLI_SUBAGENT_MAX_WIDTH_RATIO: f32 = 0.75;
+const CLI_SUBAGENT_MAX_HEIGHT_RATIO: f32 = 0.75;
 
 pub type LabelBuilderFn = dyn Fn(
     Vec<BlockIndex>,
@@ -2365,7 +2367,6 @@ impl BlockListElement {
         ai_render_context: &BlocklistAIRenderContext,
         agent_view_state: &AgentViewState,
         ctx: &mut PaintContext,
-        app: &AppContext,
     ) {
         let block_height = block.height(agent_view_state).as_f64() as f32 * cell_size.y();
         if block.is_restored()
@@ -2377,16 +2378,6 @@ impl BlockListElement {
                     Vector2F::new(bounds.width(), block_height),
                 ))
                 .with_background(warp_theme.restored_blocks_overlay());
-        }
-
-        // Update the background for the current active long running command when the inline agent view is active.
-        if agent_view_state.is_inline() && block.is_active_and_long_running() {
-            ctx.scene
-                .draw_rect_with_hit_recording(RectF::new(
-                    grid_origin,
-                    Vector2F::new(bounds.width(), block_height),
-                ))
-                .with_background(agent_view_bg_fill(app));
         }
 
         let mut did_render_ai_stripe = false;
@@ -2496,7 +2487,6 @@ impl BlockListElement {
             ai_render_context,
             agent_view_state,
             ctx,
-            app,
         );
 
         let cell_size_height = block_grid_params.grid_render_params.cell_size.y();
@@ -3360,14 +3350,16 @@ impl Element for BlockListElement {
                                 self.cli_subagent_views.get_mut(block.id())
                             {
                                 let block_height = (height.as_f64() as f32) * cell_size.y();
+                                let max_width = (constraint.max.x() * CLI_SUBAGENT_MAX_WIDTH_RATIO
+                                    - CLI_SUBAGENT_HORIZONTAL_MARGIN)
+                                    .max(0.);
+                                let max_height = (block_height - CLI_SUBAGENT_VERTICAL_MARGIN * 2.)
+                                    .min(constraint.max.y() * CLI_SUBAGENT_MAX_HEIGHT_RATIO)
+                                    .max(0.);
                                 cli_subagent_view.layout(
                                     SizeConstraint {
                                         min: vec2f(0., 0.),
-                                        max: vec2f(
-                                            constraint.max.x() * 0.4
-                                                - CLI_SUBAGENT_HORIZONTAL_MARGIN,
-                                            block_height - CLI_SUBAGENT_VERTICAL_MARGIN * 2.,
-                                        ),
+                                        max: vec2f(max_width, max_height),
                                     },
                                     ctx,
                                     app,
@@ -4617,7 +4609,7 @@ impl Element for BlockListElement {
                 is_first_mouse,
                 modifiers,
                 ..
-            } => self.mouse_down(
+            } if !handled => self.mouse_down(
                 *position,
                 *click_count,
                 *is_first_mouse,

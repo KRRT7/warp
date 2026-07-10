@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use signal_hook_mio::v1_0::Signals;
 use warp_core::channel::ChannelState;
 use warp_core::features::FeatureFlag;
+use warp_core::safe_error;
+use warp_errors::{report_error, report_if_error};
 use warpui::{AppContext, SingletonEntity};
 
 use super::event_loop::{PTY_TOKEN, SIGNALS_TOKEN};
@@ -38,7 +40,7 @@ use crate::terminal::local_tty::shell::{
 };
 use crate::terminal::model::session::command_executor::shell_escape_single_quotes;
 use crate::terminal::shell::ShellType;
-use crate::{report_if_error, ASSETS};
+use crate::ASSETS;
 
 const BASH_HISTORY_SIZE_SENTINEL: &str = "57265949261";
 
@@ -101,21 +103,15 @@ fn docker_sandbox_run_args(starter: &DockerSandboxShellStarter) -> Vec<std::ffi:
 struct Passwd<'a> {
     name: &'a str,
     dir: &'a str,
-    shell: &'a str,
 }
 
-pub fn get_pw_shell() -> String {
-    let mut buf = [0; 1024];
-    let pw = get_pw_entry(&mut buf);
-    pw.shell.to_string()
-}
-
-/// Return a Passwd struct with pointers into the provided buf.
+/// Return a `Passwd` struct with pointers into the provided buf, or `None` when the current uid
+/// has no password-database entry or the lookup fails.
 ///
 /// # Unsafety
 ///
 /// If `buf` is changed while `Passwd` is alive, bad things will almost certainly happen.
-fn get_pw_entry(buf: &mut [i8; 1024]) -> Passwd<'_> {
+fn get_pw_entry(buf: &mut [i8; 1024]) -> Option<Passwd<'_>> {
     // Create zeroed passwd struct.
     let mut entry: MaybeUninit<libc::passwd> = MaybeUninit::uninit();
 
@@ -134,23 +130,30 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Passwd<'_> {
     };
     let entry = unsafe { entry.assume_init() };
 
-    if status < 0 {
-        panic!("getpwuid_r failed");
+    if status != 0 {
+        safe_error!(
+            safe: ("passwd entry lookup failed for uid {uid} with status {status}"),
+            full: ("passwd entry lookup failed")
+        );
+        return None;
     }
 
     if res.is_null() {
-        panic!("pw not found");
+        safe_error!(
+            safe: ("passwd entry lookup failed for uid {uid}"),
+            full: ("passwd entry lookup failed")
+        );
+        return None;
     }
 
     // Sanity check.
     assert_eq!(entry.pw_uid, uid);
 
     // Build a borrowed Passwd struct.
-    Passwd {
+    Some(Passwd {
         name: unsafe { CStr::from_ptr(entry.pw_name).to_str().unwrap() },
         dir: unsafe { CStr::from_ptr(entry.pw_dir).to_str().unwrap() },
-        shell: unsafe { CStr::from_ptr(entry.pw_shell).to_str().unwrap() },
-    }
+    })
 }
 
 pub struct Pty {
@@ -185,8 +188,10 @@ pub(super) fn spawn(options: PtyOptions) -> Result<PtySpawnInfo> {
         start_dir,
         env_vars,
         enable_ssh_wrapper,
+        reuse_ssh_control_master,
         shell_debug_mode,
         honor_ps1,
+        node_version_chip_enabled,
         close_fds,
     } = options;
     let shell_starter = match shell_starter {
@@ -204,8 +209,10 @@ pub(super) fn spawn(options: PtyOptions) -> Result<PtySpawnInfo> {
         env_vars,
         start_dir,
         enable_ssh_wrapper,
+        reuse_ssh_control_master,
         shell_debug_mode,
         honor_ps1,
+        node_version_chip_enabled,
     );
 
     spawn_command_in_pty(command, &size, close_fds)
@@ -216,14 +223,17 @@ pub(super) fn spawn(options: PtyOptions) -> Result<PtySpawnInfo> {
 ///
 /// Does not perform any PTY-level setup; hand the returned `Command`
 /// to [`spawn_command_in_pty`].
+#[allow(clippy::too_many_arguments)]
 fn build_host_shell_command(
     shell_starter: DirectShellStarter,
     window_id: Option<usize>,
     env_vars: HashMap<OsString, OsString>,
     start_dir: Option<PathBuf>,
     enable_ssh_wrapper: bool,
+    reuse_ssh_control_master: bool,
     shell_debug_mode: bool,
     honor_ps1: bool,
+    node_version_chip_enabled: bool,
 ) -> Command {
     let mut buf = [0; 1024];
     let pw = get_pw_entry(&mut buf);
@@ -241,7 +251,10 @@ fn build_host_shell_command(
     // Support an overridden home directory for integration tests, which
     // should execute in a more hermetic environment than one where the home
     // directory contains whatever happens to already exist there.
-    let home_dir = std::env::var("HOME").unwrap_or_else(|_| pw.dir.to_owned());
+    let home_dir = std::env::var("HOME")
+        .ok()
+        .or_else(|| pw.as_ref().map(|pw| pw.dir.to_owned()))
+        .unwrap_or_else(|| "/".to_owned());
 
     // Unfortunately process::Command has no facility for using the same fd for in/out/err.
     // The issue is that Stdio wants to close its fd. Previously we tried Stdio::from_raw_fd(follower)
@@ -251,8 +264,15 @@ fn build_host_shell_command(
     // in the tests. Therefore we do NOT set stdin, stdout, stderr here; instead we
     // do it in the pre_exec hook.
     // Setup shell environment.
-    builder.env("LOGNAME", pw.name);
-    builder.env("USER", pw.name);
+    if let Some(user_name) = pw
+        .as_ref()
+        .map(|pw| pw.name.to_owned())
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("LOGNAME").ok())
+    {
+        builder.env("LOGNAME", &user_name);
+        builder.env("USER", &user_name);
+    }
     builder.env("HOME", &home_dir);
 
     // Specify terminal name and capabilities.
@@ -296,6 +316,13 @@ fn build_host_shell_command(
         builder.env("WARP_USE_SSH_WRAPPER", "0");
     }
 
+    // Whether the SSH wrapper should attach to an existing ControlMaster
+    // for the destination host instead of always creating its own.
+    builder.env(
+        "WARP_SSH_REUSE_CONTROL_MASTER",
+        if reuse_ssh_control_master { "1" } else { "0" },
+    );
+
     // For integration tests, put SSH control master sockets under the actual
     // home directory, as the length of the path to sockets placed in the
     // integration test home directory can exceed length limits.
@@ -324,6 +351,14 @@ fn build_host_shell_command(
     } else {
         builder.env("WARP_HONOR_PS1", "0");
     }
+
+    // Gate the shell's per-prompt `node --version` detection on whether the
+    // Node.js Version chip is enabled. The bootstrap treats any value other than
+    // "0" as enabled, so we only ever set "0" to disable it.
+    builder.env(
+        "WARP_PROMPT_NODE_VERSION_ENABLED",
+        if node_version_chip_enabled { "1" } else { "0" },
+    );
 
     // Pass through any additional entries to add to PATH.
     let path_append = extra_path_entries()
@@ -620,7 +655,7 @@ impl EventedPty for Pty {
                 Ok(true) => Some(ChildEvent::Exited),
                 Ok(false) => None,
                 Err(e) => {
-                    log::error!("Error checking child process termination: {e}");
+                    report_error!(e.context("Error checking child process termination"));
                     None
                 }
             }
@@ -693,7 +728,7 @@ fn spawn_docker_sandbox(
     // itself is created + attached in a single step via `sbx run` when
     // the PTY process spawns below.
     if let Err(e) = prepare_docker_sandbox(&docker_starter) {
-        log::error!("Failed to prepare Docker sandbox: {e}");
+        report_error!(&e);
         return Err(Error::msg(format!("Docker sandbox setup failed: {e}")));
     }
 
@@ -704,8 +739,10 @@ fn spawn_docker_sandbox(
         start_dir: _,
         env_vars,
         enable_ssh_wrapper,
+        reuse_ssh_control_master,
         shell_debug_mode,
         honor_ps1,
+        node_version_chip_enabled,
         close_fds,
     } = options;
 
@@ -714,8 +751,10 @@ fn spawn_docker_sandbox(
         window_id,
         env_vars,
         enable_ssh_wrapper,
+        reuse_ssh_control_master,
         shell_debug_mode,
         honor_ps1,
+        node_version_chip_enabled,
     );
 
     spawn_command_in_pty(command, &size, close_fds)
@@ -727,13 +766,16 @@ fn spawn_docker_sandbox(
 ///
 /// Does not perform any PTY-level setup; hand the returned `Command`
 /// to [`spawn_command_in_pty`].
+#[allow(clippy::too_many_arguments)]
 fn build_docker_sandbox_command(
     docker_starter: &DockerSandboxShellStarter,
     window_id: Option<usize>,
     env_vars: HashMap<OsString, OsString>,
     enable_ssh_wrapper: bool,
+    reuse_ssh_control_master: bool,
     shell_debug_mode: bool,
     honor_ps1: bool,
+    node_version_chip_enabled: bool,
 ) -> Command {
     let mut buf = [0; 1024];
     let pw = get_pw_entry(&mut buf);
@@ -748,7 +790,10 @@ fn build_docker_sandbox_command(
         builder.arg(arg);
     }
 
-    let home_dir = std::env::var("HOME").unwrap_or_else(|_| pw.dir.to_owned());
+    let home_dir = std::env::var("HOME")
+        .ok()
+        .or_else(|| pw.as_ref().map(|pw| pw.dir.to_owned()))
+        .unwrap_or_else(|| "/".to_owned());
 
     // Environment variables set on the host-side `sbx` process.
     //
@@ -762,8 +807,15 @@ fn build_docker_sandbox_command(
     // Once we've validated what the container bootstrap actually needs,
     // we can trim this list down to the variables the in-container bash
     // session actually consumes.
-    builder.env("LOGNAME", pw.name);
-    builder.env("USER", pw.name);
+    if let Some(user_name) = pw
+        .as_ref()
+        .map(|pw| pw.name.to_owned())
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("LOGNAME").ok())
+    {
+        builder.env("LOGNAME", &user_name);
+        builder.env("USER", &user_name);
+    }
     builder.env("HOME", &home_dir);
     builder.env("TERM", "xterm-256color");
     builder.env("TERM_PROGRAM", "WarpTerminal");
@@ -783,6 +835,10 @@ fn build_docker_sandbox_command(
         "WARP_USE_SSH_WRAPPER",
         if enable_ssh_wrapper { "1" } else { "0" },
     );
+    builder.env(
+        "WARP_SSH_REUSE_CONTROL_MASTER",
+        if reuse_ssh_control_master { "1" } else { "0" },
+    );
     builder.env("SSH_SOCKET_DIR", ssh_socket_dir());
     builder.env("WARP_IS_LOCAL_SHELL_SESSION", "1");
     if FeatureFlag::HOANotifications.is_enabled() {
@@ -795,6 +851,10 @@ fn build_docker_sandbox_command(
         builder.env("WARP_SHELL_DEBUG_MODE", "1");
     }
     builder.env("WARP_HONOR_PS1", if honor_ps1 { "1" } else { "0" });
+    builder.env(
+        "WARP_PROMPT_NODE_VERSION_ENABLED",
+        if node_version_chip_enabled { "1" } else { "0" },
+    );
     let path_append = extra_path_entries()
         .map(|p| p.to_string_lossy().into_owned())
         .join(":");
@@ -859,7 +919,8 @@ fn prepare_docker_sandbox(starter: &DockerSandboxShellStarter) -> Result<()> {
     };
 
     // 1. Write the init script to this sandbox's dedicated host init dir.
-    let init_script = raw_init_shell_script_for_shell(ShellType::Bash, &ASSETS);
+    let init_script =
+        raw_init_shell_script_for_shell(ShellType::Bash, &ASSETS, starter.session_id());
     let init_dir = starter.init_dir();
     mk_owner_only_dir(&init_dir)?;
     std::fs::write(starter.init_path(), init_script).context("write sandbox init script")?;

@@ -47,6 +47,9 @@ type AIConversation {
   artifacts: [AIConversationArtifact!]!
   conversationId: ID!
 
+  """Public profile for the user who originally created the conversation, when available."""
+  creator: PublicUserProfile
+
   """Base64-encoded proto binary of the final task list."""
   finalTaskList: String!
 
@@ -610,8 +613,36 @@ type BundledActions {
   latestTimestamp: Time!
   oldestTimestamp: Time!
 }
+"""
+A configured first-party provider credential. Presence in the list means a key is
+configured for that provider.
+"""
+type ByoFirstPartyKey {
+  credentialUid: ID!
+  provider: LlmProvider!
+}
 
 type ByoApiKeyPolicy {
+  enabled: Boolean!
+}
+type ByoEndpointMetadata {
+  "Credential handle for this endpoint."
+  credentialUid: ID!
+  enabled: Boolean!
+  models: [ByoEndpointModelMetadata!]!
+  name: String!
+  uid: ID!
+}
+
+type ByoEndpointModelMetadata {
+  alias: String
+  configKey: String!
+  displayName: String!
+  enabled: Boolean!
+  slug: String!
+}
+
+type ByoEndpointPolicy {
   enabled: Boolean!
 }
 
@@ -777,6 +808,26 @@ type ContentDataFieldValue {
 
 scalar ContentHash
 
+"""The kind of a context-window segment."""
+enum ContextWindowSegmentType {
+  UNKNOWN
+  SYSTEM_PROMPT
+  TOOL_DEFINITIONS
+  CONVERSATION_HISTORY
+  LATEST_INPUT
+  IMAGES
+  OTHER
+}
+
+"""A single portion of the context window, described by its kind and token count."""
+type ContextWindowSegment {
+  """The kind of context window segment this entry represents."""
+  segmentType: ContextWindowSegmentType!
+
+  """The estimated number of tokens this segment occupies."""
+  tokenCount: Int!
+}
+
 """Represents usage data for a single multi-agent conversation."""
 type ConversationUsage {
   conversationId: String!
@@ -789,6 +840,14 @@ type ConversationUsage {
 type ConversationUsageMetadata {
   """Token usage using a user's API key, keyed by model."""
   byokTokenUsage: [TokenUsage!]!
+
+  """
+  A breakdown of the context window usage into segments, each carrying a
+  kind and token count. Segment token counts add up to the token total
+  represented by contextWindowUsage. The client derives per-segment
+  percentages.
+  """
+  contextWindowSegments: [ContextWindowSegment!]!
   contextWindowUsage: Float!
 
   """The total number of inference credits spent so far in the conversation"""
@@ -915,6 +974,23 @@ type CreateManagedSecretOutput implements Response {
 }
 
 union CreateManagedSecretResult = CreateManagedSecretOutput | UserFacingError
+
+input CreateManagedMcpClientConfigInput {
+  uid: ID!
+}
+
+type CreateManagedMcpClientConfigOutput implements Response {
+  transportKind: ManagedMcpTransportKind!
+  mcpConfigJson: String!
+  proxyUrl: String
+  proxyToken: String
+  authorizationHeaderName: String
+  authorizationHeaderValue: String
+  expiresAt: Time
+  responseContext: ResponseContext!
+}
+
+union CreateManagedMcpClientConfigResult = CreateManagedMcpClientConfigOutput | UserFacingError
 
 input CreateNotebookInput {
   aiDocumentId: String
@@ -1988,6 +2064,19 @@ type LlmHostSettings {
   enablementSetting: HostEnablementSetting
 
   """
+  Full resource name of the GCP workload identity provider that Gemini Enterprise
+  clients exchange Warp OIDC JWTs against (used as both the JWT audience and the
+  STS exchange audience).
+  """
+  gcpAudience: String
+
+  """
+  Email of the GCP service account that Gemini Enterprise clients impersonate after
+  the STS exchange. Empty means the federated token is used directly.
+  """
+  gcpSaEmail: String
+
+  """
   IAM role ARN that Oz Cloud Agents assume via the OIDC trust flow to obtain credentials for AWS Bedrock requests.
   """
   oidcAssumeRoleArn: String
@@ -2041,6 +2130,7 @@ enum LlmModelHost {
   AWS_BEDROCK
   CUSTOM_ENDPOINT
   DIRECT_API
+  GEMINI_ENTERPRISE
 }
 
 type LlmModelHostSettings {
@@ -2202,6 +2292,9 @@ type ManagedSecretConfig {
   """
   publicKey: String
 }
+type ManagedByokByoePolicy {
+  enabled: Boolean!
+}
 
 """A managed secret value representing an OpenAI API key."""
 type ManagedSecretOpenAiApiKeyValue {
@@ -2217,6 +2310,11 @@ type ManagedSecretOpenAiApiKeyValue {
 """A raw, unencrypted managed secret value."""
 type ManagedSecretRawValue {
   value: String!
+}
+
+enum ManagedMcpTransportKind {
+  URL
+  COMMAND
 }
 
 """Type of Warp-managed secret values."""
@@ -2841,6 +2939,7 @@ type RootMutation {
   createFileArtifactUploadTarget(input: CreateFileArtifactUploadTargetInput!, requestContext: RequestContext!): CreateFileArtifactUploadTargetResult!
   createFolder(input: CreateFolderInput!, requestContext: RequestContext!): CreateFolderResult!
   createGenericStringObject(input: CreateGenericStringObjectInput!, requestContext: RequestContext!): CreateGenericStringObjectResult!
+  createManagedMcpClientConfig(input: CreateManagedMcpClientConfigInput!, requestContext: RequestContext!): CreateManagedMcpClientConfigResult!
   createManagedSecret(input: CreateManagedSecretInput!, requestContext: RequestContext!): CreateManagedSecretResult!
   createNotebook(input: CreateNotebookInput!, requestContext: RequestContext!): CreateNotebookResult!
   createSimpleIntegration(input: CreateSimpleIntegrationInput!, requestContext: RequestContext!): CreateSimpleIntegrationResult!
@@ -3521,6 +3620,14 @@ type TeamSizePolicy {
   isUnlimited: Boolean!
   limit: Int!
 }
+type TeamByoSettings {
+  allowUserEndpoints: Boolean!
+  allowUserKeys: Boolean!
+  endpoints: [ByoEndpointMetadata!]!
+  endpointsEnabled: Boolean!
+  firstPartyEnabled: Boolean!
+  firstPartyKeys: [ByoFirstPartyKey!]!
+}
 
 type TelemetryDataCollectionPolicy {
   default: Boolean!
@@ -3543,6 +3650,7 @@ type Tier {
   ambientAgentsPolicy: AmbientAgentsPolicy
   anyoneWithLinkSharingPolicy: AnyoneWithLinkSharingPolicy
   byoApiKeyPolicy: ByoApiKeyPolicy
+  byoEndpointPolicy: ByoEndpointPolicy
   cloudConversationStoragePolicy: CloudConversationStoragePolicy
   codebaseContextPolicy: CodebaseContextPolicy
   customLlmPolicy: CustomLlmPolicy
@@ -3556,6 +3664,7 @@ type Tier {
   enterpriseSecretRedactionPolicy: EnterpriseSecretRedactionPolicy
   enterpriseSpendingLimitsPolicy: EnterpriseSpendingLimitsPolicy
   enterpriseUsageThresholdsPolicy: EnterpriseUsageThresholdsPolicy
+  managedByokByoePolicy: ManagedByokByoePolicy
   multiAdminPolicy: MultiAdminPolicy
   name: String!
   pricing: TierPricing
@@ -4361,6 +4470,7 @@ type WorkspaceSettings {
   llmSettings: LlmSettings!
   sandboxedAgentSettings: SandboxedAgentSettings
   secretRedactionSettings: SecretRedactionSettings!
+  teamByo: TeamByoSettings
   telemetrySettings: TelemetrySettings!
   ugcCollectionSettings: UgcCollectionSettings!
   usageBasedPricingSettings: UsageBasedPricingSettings!

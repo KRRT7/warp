@@ -11,7 +11,9 @@ use crate::ai::skills::SkillManager;
 use crate::search::slash_command_menu::StaticCommand;
 use crate::settings::InputSettings;
 use crate::terminal::input::buffer_model::{InputBufferModel, InputBufferUpdateEvent};
-use crate::terminal::input::slash_commands::SlashCommandDataSource;
+use crate::terminal::input::slash_commands::{
+    GuiSlashCommandDataSource, SlashCommandDataSource as _,
+};
 use crate::terminal::model::session::active_session::ActiveSession;
 
 /// Event emitted by the slash command model when its entry state is updated.
@@ -122,7 +124,7 @@ pub struct SlashCommandModel {
     ai_input_model: ModelHandle<BlocklistAIInputModel>,
     active_session: ModelHandle<ActiveSession>,
     state: SlashCommandEntryState,
-    data_source: ModelHandle<SlashCommandDataSource>,
+    data_source: ModelHandle<GuiSlashCommandDataSource>,
 }
 
 impl SlashCommandModel {
@@ -130,10 +132,10 @@ impl SlashCommandModel {
         buffer_model: &ModelHandle<InputBufferModel>,
         ai_input_model: &ModelHandle<BlocklistAIInputModel>,
         active_session: ModelHandle<ActiveSession>,
-        data_source: ModelHandle<SlashCommandDataSource>,
+        data_source: ModelHandle<GuiSlashCommandDataSource>,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
-        ctx.subscribe_to_model(buffer_model, |me, event, ctx| {
+        ctx.subscribe_to_model(buffer_model, |me, _, event, ctx| {
             me.handle_input_buffer_update(event, ctx);
         });
 
@@ -142,7 +144,7 @@ impl SlashCommandModel {
             //
             // In the new modality, slash commands _are_ accessible in the terminal view, which is
             // in locked shell mode if NLD is disabled.
-            ctx.subscribe_to_model(ai_input_model, |me, event, ctx| match event {
+            ctx.subscribe_to_model(ai_input_model, |me, _, event, ctx| match event {
                 BlocklistAIInputEvent::InputTypeChanged { config }
                 | BlocklistAIInputEvent::LockChanged { config } => {
                     if config.is_locked {
@@ -248,10 +250,8 @@ impl SlashCommandModel {
 
         let skill_name = possible_command.strip_prefix('/')?;
 
-        let cwd_path = self
-            .active_session
-            .as_ref(ctx)
-            .current_working_directory_location(ctx);
+        let active_session = self.active_session.as_ref(ctx);
+        let cwd_path = active_session.current_working_directory_location(ctx);
         let skills = SkillManager::handle(ctx)
             .as_ref(ctx)
             .get_skills_for_working_directory(cwd_path.as_ref(), ctx);
@@ -424,7 +424,7 @@ impl Entity for SlashCommandModel {
     type Event = UpdatedSlashCommandModel;
 }
 
-impl SlashCommandDataSource {
+impl GuiSlashCommandDataSource {
     // Matches `buffer` against active slash commands, returning the detected command and
     // space-delimited argument (if provided).
     //

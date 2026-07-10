@@ -14,6 +14,7 @@ use std::thread::{self, JoinHandle};
 use log::error;
 use mio::{self, Events, Interest};
 use parking_lot::{FairMutex, FairMutexGuard};
+use warp_errors::report_error;
 
 use super::mio_channel::Receiver;
 use crate::terminal::event_listener::ChannelEventListener;
@@ -246,11 +247,17 @@ where
             };
 
             // Process the bytes read into the buffer.
+            let mut terminal_response_sequences = Vec::new();
             state.parser.parse_bytes(
                 terminal.deref_mut(),
                 &buf[..bytes_in_buffer],
-                &mut self.pty.writer(),
+                &mut terminal_response_sequences,
             );
+            if !terminal_response_sequences.is_empty() {
+                state
+                    .write_list
+                    .push_back(Cow::Owned(terminal_response_sequences));
+            }
 
             bytes_processed += bytes_in_buffer;
             bytes_in_buffer = 0;
@@ -370,10 +377,16 @@ where
 
                     // If there were no events but `poll` returned, that means we hit the timeout.
                     if events.is_empty() {
-                        state
-                            .parser
-                            .finish_sync_output(&mut *self.terminal.lock(), &mut self.pty.writer());
-                        continue;
+                        let mut terminal_response_sequences = Vec::new();
+                        state.parser.finish_sync_output(
+                            &mut *self.terminal.lock(),
+                            &mut terminal_response_sequences,
+                        );
+                        if !terminal_response_sequences.is_empty() {
+                            state
+                                .write_list
+                                .push_back(Cow::Owned(terminal_response_sequences));
+                        }
                     }
 
                     for event in events.iter() {
@@ -470,7 +483,7 @@ where
                 if !child_exited {
                     let res = self.pty.kill();
                     if let Err(err) = res {
-                        log::error!("Failed to kill PTY process {err:?}");
+                        report_error!(err.context("Failed to kill PTY process"));
                     }
                 }
                 // Notify the terminal model that the PTY process has exited.
